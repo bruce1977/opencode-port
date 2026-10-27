@@ -1,0 +1,30 @@
+# 业务默认值，随镜像打包（通过 CONFIG_PATH 指定，默认 ./config/config.yaml）
+# 直接入库，不含任何敏感信息（密钥只走环境变量，见 AGENTS.md §5）
+
+models:
+  auto:
+    # auto 模式：仅对“内置模型”（opencode/*-free 系列）做正则匹配后随机选一款
+    regex:
+      - '^opencode/(?:big-pickle|(?:deepseek|glm|mimo)-v\d+\.\d+(?:-flash)?-free)$'
+    exclude: []            # 排除名单（国内不可用 / 不稳定）
+    fallback: ""           # 池为空时的兜底模型（内置模型 ID，如 opencode/flint-40b-free）
+  aliases: {}              # 内置模型短名映射，如 { flint: "opencode/flint-40b-free" }
+
+ollama:
+  # 短名 → ollama/<id>，如 { qwen: "ollama/qwen3:4b" }
+  # 注意：Ollama 模型本体须在 config/opencode.json 的 provider.ollama.models 声明
+  aliases: { "qwen3.5":"ollama-local/qwen3.5:9b" }
+
+web_search:
+  model: "ollama-local/qwen3.5:9b"   # 必须是内置模型（web-search 独立 API 的默认 model；仅 synthesize=true 时驱动模型）
+  synthesize_default: false          # 默认是否用该内置模型综合答案
+
+search:
+  provider: "duckduckgo"   # 默认免费后端；可选 bing / brave / custom
+  base_url: ""             # custom 后端地址
+  headers: {}              # custom 后端请求头
+  top_k: 5                 # 默认结果条数（API 请求参数可覆盖）
+  max_chars_per_page: 4000 # 默认单页截断（API 请求参数可覆盖）
+
+session:
+  ttl_min: 30

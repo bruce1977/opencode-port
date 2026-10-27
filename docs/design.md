@@ -1,0 +1,395 @@
+# OpenCode API Gateway —— 项目设计文档
+
+> 工作标题：`opencode-api-gateway`（可重命名）
+> 衍生自：[TiaraBasori/OpenCode2API](https://github.com/TiaraBasori/OpenCode2API)
+> 状态：设计阶段（待评审）
+
+---
+
+## 1. 项目背景与目标
+
+### 1.1 背景
+
+[OpenCode](https://opencode.ai)（2.x 起仓库为 [anomalyco/opencode](https://github.com/anomalyco/opencode)）是一个本地运行的开源代码智能体（CLI）。它通过 `opencode serve` 启动一个无头 HTTP 服务，对外暴露 **OpenAPI 3.1** 端点（路由前缀 `/api/*`）；官方同时提供由该规范自动生成的 TypeScript 客户端（`@opencode/client`，与 CLI `@opencode/cli` 同版本耦合）。
+
+OpenCode 内置了若干**免费模型**（`opencode/*-free` 系列，免登录、cost=0），也支持把 **Ollama / LM Studio / 任意 OpenAI 兼容服务** 作为本地 provider 接入。
+
+原项目 [OpenCode2API](https://github.com/TiaraBasori/OpenCode2API) 已经验证了「把 OpenCode 运行时包装成 OpenAI 兼容 API 网关」这一路线的可行性：它启动 `opencode serve` 后端，再用 SDK 与后端通信，对上暴露 `/v1/chat/completions`、`/v1/responses`、`/v1/messages` 等端点。
+
+### 1.2 目标与定位
+
+本项目在 OpenCode2API 的基础上做**差异化改造**，目标是把 OpenCode 的内置能力收敛成一个**稳定、可配置、对国内环境友好**的推理 API 服务。核心能力：
+
+1. **标准 API 使用免费模型推理**：兼容 OpenAI 的 Chat Completions / Responses API，可直接用内置免费模型推理。
+2. **`auto` 模型模式**：通过配置指定模型名称**正则表达式**，在匹配到的模型列表里**随机**选一款进行推理，规避「免费模型名称不固定、部分模型国内不可用」的问题。
+3. **Ollama 自定义模型接入**：可在配置中声明 Ollama 服务里的自定义模型，并经由本网关对外暴露。
+4. **独立 web-search API**：输入关键词 → 返回匹配网页段落文字；需指定内置模型驱动，不内嵌为工具。
+5. **可选 API KEY 鉴权**：通过请求头 `Authorization: Bearer <key>` 做安全认证，可开关。
+
+### 1.3 与原项目的功能差异（对照）
+
+| 维度 | OpenCode2API（原） | 本项目（衍生） |
+|:-----|:-------------------|:---------------|
+| 模型选择 | 模型别名解析（如 `gpt5-nano → gpt-5-nano`）、allowlist | **新增 `auto` 正则随机模式** + 国内可用性过滤 |
+| 外部工具 | `web_fetch`（按 URL 抓取）、工具桥接 | **独立 `web_search` API**（关键词 → 段落文字，需指定内置模型） |
+| Ollama | 依赖 OpenCode 自身 provider 配置 | **显式配置项**声明 Ollama 自定义模型并对外暴露 |
+| 鉴权 | `API_KEY` / 多用户 key | 同样支持，定位为**可选开关** |
+| 端点 | chat/responses/messages + 面板/指标 | 聚焦 chat/responses，面板/指标作为可选扩展 |
+
+---
+
+## 2. 关键术语
+
+| 术语 | 含义 |
+|:-----|:-----|
+| `opencode serve` | OpenCode 的无头 HTTP 服务，暴露 OpenAPI 端点（路由前缀 `/api/*`，默认端口 `4096`，host `127.0.0.1`） |
+| OpenCode 客户端 | `@opencode/client`（2.x；scope 为 `@opencode`，不带 `-ai`），由服务端 OpenAPI 规范生成，**版本必须与 CLI `@opencode/cli` 同版本**（当前 `2.1.4`） |
+| OpenCode 内置免费模型 | `opencode/*-free` 系列（如 `opencode/flint-40b-free`），免登录、cost=0，经 `model.list()` 返回 |
+| Ollama provider | 通过 `@ai-sdk/openai-compatible` 适配器接入本地 Ollama，模型全称为 `ollama/<id>` |
+| `auto` 模式 | 请求 `model: "auto"` 时，由网关按配置正则从可用模型池中**随机**选一款 |
+| web-search 独立 API | 对外暴露检索能力：关键词 → 段落文字；检索主路径为服务端 websearch，需指定内置模型（`synthesize` 时驱动综合） |
+
+---
+
+## 3. 总体架构
+
+```mermaid
+flowchart TB
+    Client[客户端 / OpenAI SDK] -->|HTTP SSE| Gateway[API 网关层<br/>Fastify]
+    Gateway --> Auth[鉴权中间件<br/>可选 Bearer]
+    Gateway --> Resolver[模型解析层<br/>auto 正则 / Ollama / 显式]
+    Gateway --> WebSearch[web-search 独立 API<br/>服务端 websearch 优先]
+    Resolver --> SDK[客户端适配层<br/>@opencode/client]
+    WebSearch --> Search[兜底搜索后端<br/>可插拔]
+    Search --> Fetch[网页抓取 + 段落抽取]
+    SDK -->|OpenCode.make| Server[opencode serve<br/>子进程 / 已有实例]
+    Server --> Free[(OpenCode 内置免费模型<br/>opencode/*-free)]
+    Server --> Ollama[(Ollama 本地模型)]
+    Gateway --> Config[配置层<br/>env + config.yaml]
+
+    subgraph 本进程
+        Gateway
+        Auth
+        Resolver
+        WebSearch
+        SDK
+        Config
+    end
+
+    subgraph 子进程/外部
+        Server
+        Free
+        Ollama
+        Search
+        Fetch
+    end
+```
+
+### 3.1 分层职责
+
+1. **进程/服务层**：负责拉起并管理 `opencode serve` 子进程（亦可连接已存在的实例），提供健康检查、优雅退出。
+2. **客户端适配层**：封装 `@opencode/client`（2.x），全部出站请求走注入的 `fetch`（带超时 + AbortSignal），向上提供归一化接口：`getServerInfo()`、`listModels()`、`createSession()`、`switchModel()`、`putInstruction()`、`prompt()`、`promptStream()`、`getMessages()`、`webSearch()`、`deleteSession()`。
+3. **模型解析层**：把请求中的 `model` 字段翻译为 OpenCode 实际模型（`{providerID, id}`；auto 随机 / Ollama / 显式透传）。
+4. **API 网关层**：对外暴露 OpenAI 兼容端点，处理鉴权、协议转换、SSE 流式回传。
+5. **web-search 模块**：独立 API，服务端 websearch 优先（兜底可插拔搜索后端），对外返回段落文字。
+6. **配置层**：集中管理端口、server 地址/密码、auto 正则、别名、搜索后端、API KEY 等。
+
+---
+
+## 4. 核心流程
+
+### 4.1 启动流程（opencode serve 生命周期）
+
+```mermaid
+sequenceDiagram
+    participant M as 主进程
+    participant S as opencode serve
+    participant C as @opencode/client
+    participant H as GET /health
+
+    M->>M: 加载项目根 .env（真实环境变量优先）
+    M->>S: TCP 探测 OPENCODE_SERVER_PORT（isPortOpen）
+    alt 端口已监听
+        M->>C: OpenCode.make 直连现有实例（不 spawn）
+        M->>S: GET /api/info 识别实例/密码（异常仅告警）
+    else 端口空闲
+        M->>S: spawn: opencode serve --port ... --hostname 127.0.0.1
+        M->>S: 注入 OPENCODE_SERVER_PASSWORD
+        S-->>M: stdout 监听 "server listening on http://..."
+    end
+    M->>C: GET /api/model 拉取完整模型清单（同时预热 auto 池）
+    C-->>M: ModelInfo[]（内置 + 自定义 provider）
+    M->>M: 终端按 provider 分组输出（含虚拟 auto）
+    loop 每 60s
+        M->>H: GET /health（API_KEY_ENABLED 时带 Bearer）
+        H-->>M: status / opencode.healthy / version / 延迟
+    end
+```
+
+- 启动第一件事：加载项目根 `.env`（真实环境变量优先；容器内无 `.env` 属正常），再做配置校验。
+- **端口优先探测**：用 TCP `connect` 判断 `OPENCODE_SERVER_PORT` 是否已监听。已监听则直接用 client 连接现有实例、**不 spawn**（生命周期也不归网关管理）；端口空闲才按配置端口与 `OPENCODE_SERVER_PASSWORD` 拉起子进程。
+- `/api/info` 只用于识别实例与密码提示：200 视为 OpenCode；401 提示密码不一致；404/5xx 等异常响应告警但仍按配置直连，由 `/health` 暴露为 `degraded`。
+- 端口通过环境变量配置（默认后端 `10001`，网关 `10000`）；后端 host 固定 `127.0.0.1`。
+- 若 `OPENCODE_SERVER_URL` 已指向外部运行实例，则**不**拉起子进程，仅做客户端连接（便于复用已登录态 / 多实例）；启动时会探测一次，不可达仅告警。
+- 鉴权：OpenCode server 端用 `OPENCODE_SERVER_PASSWORD`（用户名固定 `opencode`）做 HTTP Basic；客户端所有请求携带该凭据。
+- **启动清单**：网关监听成功后拉取一次 `model.list()`，按 provider 分组把内置模型与自定义模型（Ollama 等）输出到终端，并附虚拟模型 `auto`；拉取失败只告警，不阻塞启动。
+- **每分钟自测**：以 60s 间隔请求网关自身的 `/health`，记录状态、后端版本、延迟与连续失败次数；退出时先停自测再关网关与后端。
+
+### 4.2 推理请求流程
+
+```mermaid
+sequenceDiagram
+    participant U as 客户端
+    participant G as 网关
+    participant R as 模型解析层
+    participant S as opencode serve
+    participant M as 模型(内置/Ollama)
+
+    U->>G: POST /v1/chat/completions {model, messages, stream}
+    G->>G: 鉴权校验（若开启）
+    G->>R: resolve(model)
+    alt model == "auto"
+        R->>S: GET /api/model 拉取可用模型（TTL 缓存）
+        R->>R: 按正则过滤 + 剔除排除名单 → 随机选 1
+    else Ollama / 显式 / 别名
+        R->>R: 直接映射为 {providerID, id}
+    end
+    R-->>G: {providerID, id, name}
+    G->>S: POST /api/session({model}) 建会话
+    G->>S: instructions entry PUT 注入 system（可选）
+    G->>S: POST .../prompt({text, files}) 异步投递
+    S->>M: 推理（流式事件）
+    G->>S: POST .../wait 阻塞至会话空闲
+    S-->>G: 流式：/api/event 的 session.text.delta；非流式：读最终助手消息
+    G-->>U: OpenAI SSE chunks（结束后以最终全文对账补发）
+```
+
+### 4.3 `auto` 模型选择算法
+
+1. 网关启动时（并周期性刷新，TTL 60s）调用 `model.list()`（`GET /api/model`），得到当前 OpenCode 可用的**内置模型**全集（`opencode/*-free` 免费模型及已连接 provider，过滤 `enabled=false` 与 `deprecated`/`alpha`；**不含 Ollama 自定义**，见 api.md §7.2）。
+2. 对 config/config.yaml `models.auto.regex` 的每条（可多条，支持分组），用 `RegExp` 匹配模型名。
+3. 从匹配结果中**剔除** config/config.yaml `models.auto.exclude`（国内不可用 / 已知不稳定）名单。
+4. 若结果非空，`Math.random()` 随机取一款；若为空，回退到 `models.auto.fallback` 显式模型或返回 503。
+5. 每次请求独立随机，避免热点模型被集中打满。
+
+> 设计动机：免费模型名称随 OpenCode 版本/区域变动，且部分模型在国内网络不可用；正则 + 排除名单 + 随机，可在「无需人工频繁改配置」的前提下保持服务可用。
+
+### 4.4 Ollama 自定义模型接入
+
+- **配置位置**：Ollama 的 provider 配置写在 OpenCode 的 `config/opencode.json`（`provider.ollama`：`npm: @ai-sdk/openai-compatible` + `options.baseURL` + `models`），随 Docker 镜像打包；**不再通过环境变量**（`OLLAMA_BASE_URL` / `OLLAMA_MODELS` 移除）。
+- 模型全称对外暴露为 `ollama/<id>`；网关经 `model.list()` 读取已声明的 Ollama 模型，用于校验与 `/v1/models` 展示。
+- **命名规则**：`ollama/<ollama-model-id>`，`<id>` 必须与 `ollama list` 一致且在 `config/opencode.json` 中声明；可选 config/config.yaml `ollama.aliases` 短名映射。完整规则见 api.md §7.3。
+- 客户端请求 `model: "ollama/qwen3:4b"` 即可走本地推理，零成本、可离线。
+- 注意：Ollama 工具调用需要足够 `num_ctx`，建议在 Ollama 侧适当调大（16k–32k）。
+
+### 4.5 web-search 独立 API
+
+目标：对外提供**独立的 web-search API**（不内嵌为工具、不追求工具调用通用性）。输入关键词，返回匹配网页的**段落文字**。
+
+```mermaid
+flowchart LR
+    A[POST /v1/web_search<br/>model(内置) + query] --> B[服务端 websearch<br/>websearch.query]
+    B --> C[服务端已配置后端<br/>exa/tavily/...]
+    C --> D[结果 URL + 摘要]
+    D --> E[抓取原页 + 段落抽取 + 截断]
+    E --> F[返回 text / results]
+    E -.synthesize=true.-> G[内置模型综合 answer]
+    B -.失败.-> H[兜底 SearchProvider<br/>duckduckgo/...]
+    H --> E
+```
+
+- **服务端 websearch 优先**：优先调用 OpenCode 2.x 服务端一等公民 `websearch.query()`（服务端自选已配置后端）；失败（未配置后端 / 503 等）时回退到自实现可插拔 `SearchProvider`（`duckduckgo`/`bing`/`brave`/`custom`），响应 `engine` 字段反映实际路径。
+- **必须指定内置模型**：`model` 为 `<provider>/<id>` 的内置模型（拒绝 `auto` / `ollama/...`）；可用 config/config.yaml `web_search.model` 作为默认。2.x 下检索本身不消耗模型，该模型仅在 `synthesize=true` 时驱动答案综合。
+- **抓取与抽取**：对结果 URL 发 HTTP GET，用轻量正文抽取得到段落；按 `top_k` 与请求 `max_chars_per_page`（默认取 config/config.yaml）截断，避免 token 爆炸。
+- **错误处理**：单页失败不影响其余；超时/反爬返回空段落（或以摘要兜底）；整体失败才 502。
+- 详细请求/响应见 [api.md §8](./api.md)。
+
+### 4.6 鉴权
+
+- 开关 `API_KEY_ENABLED`；开启时，所有 `/v1/*` 与 `/panel`（如启用）需携带 `Authorization: Bearer <key>`，否则 `401`。
+- key 存于环境变量 `API_KEY`（单 key）。默认仅使用免费资源，多用户/付费 key 暂不纳入。
+- `OPENCODE_SERVER_PASSWORD`（OpenCode 后端）与**本网关 API KEY 是两套独立凭据**：前者保护 OpenCode server，后者保护对外 API。
+
+---
+
+## 5. 模块设计
+
+> 实现语言为**纯 JavaScript ESM**（`.mjs`，无 TypeScript / 无构建步骤），类型信息用 JSDoc 标注；相对 import 必须带 `.mjs` 扩展名。所有源码须通过 `npm run lint`（ESLint 10 flat config），规范正文见仓库根 `AGENTS.md`。
+
+### 5.1 进程管理模块 `core/server-manager.mjs`
+- `isPortOpen()` / `startServe()` / `stopServe()` / `isHealthy()`
+- 启动时先做 TCP 端口探测：已监听则复用现有实例，空闲才 spawn；子进程 stdout 解析启动标志，退出自动重启（带退避）。
+- 支持「外部实例模式」（不拉起子进程）。
+
+### 5.2 客户端适配层 `core/opencode-client.mjs`
+- 封装 `@opencode/client`（`OpenCode.make({ baseUrl, headers, fetch })`）；注入自定义 `fetch` 统一附加 Basic 凭据与超时控制。
+- 暴露：`getServerInfo()` / `health()` / `listModels()` / `createSession({model})` / `switchModel()` / `putInstruction()` / `prompt({text, files, system})` / `promptStream({..., onDelta, signal})` / `getMessages()` / `webSearch()` / `listWebSearchProviders()` / `deleteSession()`。
+- **推理生命周期**：`prompt` 为异步投递（2.x 语义），适配层内部用 `session.wait()` 阻塞至会话空闲，再按 `order:"asc"` 读取消息列表取**最后一条** assistant 消息归一化（`normalizeAssistant`：text / reasoning / tools / finish / tokens / cost / error）。
+- **流式对账**：订阅 `/api/event` 的 `session.text.delta` 转发增量；`wait` 返回后以最终助手消息全文对账，补齐订阅窗口外丢失的开头/尾部。
+- **错误归一**：助手消息内嵌 `SessionStructuredError`（如 `ProviderAuthError`）→ 统一 502 `upstream_error`。
+
+### 5.3 模型解析层 `core/model-resolver.mjs`
+- `resolve(requestedModel)` → `{ provider, modelId }`
+- 维护 auto 池（带 TTL 缓存与刷新）、排除名单、fallback。
+- 维护 Ollama 模型映射表。
+
+### 5.4 API 网关层 `api/*`
+- `routes/health.mjs`、`routes/models.mjs`、`routes/chat.mjs`、`routes/responses.mjs`、`routes/messages.mjs`、`routes/web-search.mjs`
+- 协议转换：OpenAI 请求体 → OpenCode `parts`；OpenCode 消息流 → OpenAI SSE（`chat.completion.chunk` / Responses 事件）。
+- 会话映射：客户端 `session`/`conversation` 概念 ↔ OpenCode `session.id`，带 TTL 清理。
+
+### 5.5 web-search 模块 `tools/web-search.mjs`
+- `runWebSearch({ model, query, topK, ... })` → `{ text, results?, answer?, engine }`
+- 优先**服务端 websearch**（`websearch.query()`，服务端自选已配置后端）；失败兜底走 `SearchProvider` 抽象，便于替换后端。
+
+### 5.6 模型命名与解析 `core/model-resolver.mjs`
+- 实现 api.md §7 的命名规则与解析优先级（`auto` / 内置 / `ollama/` / 别名）。
+- 维护 config/config.yaml `ollama.aliases` 别名表、auto 池、排除名单、fallback。
+
+### 5.7 配置层 `config.mjs`
+- 使用 `zod` 校验环境变量 + `config/config.yaml`，集中暴露 `AppConfig`。
+- `loadDotEnv()` 供进程入口在配置校验前加载项目根 `.env`（真实环境变量优先），不引入 dotenv 依赖。
+
+### 5.8 启动清单与运行期自测
+- `startup-report.mjs`：把 `resolver.listAll()` 的结果整理成终端可读清单（内置 provider 在前，自定义 provider 分组，附虚拟 `auto`）；只做展示，不参与解析。
+- `core/health-monitor.mjs`：`startHealthSelfTest()` 每 60s 请求网关自身 `/health`，带超时与 `AbortSignal`，失败只记 warn 并累计次数；`stop()` 可中止定时器与在途请求。
+
+---
+
+## 6. 配置体系
+
+配置按**职责分层**：版本在 Dockerfile 固定，敏感/部署相关走环境变量，业务默认走 `config/config.yaml`，Ollama provider 走 OpenCode 自身配置。
+
+### 6.1 Dockerfile（版本绑定，非环境变量）
+
+- `@opencode/cli` 与 `@opencode/client` 版本在**构建期**固定（`ARG OPENCODE_CLI_VERSION` / `package.json` + lockfile），随镜像固化；两者**必须同版本**（当前 `2.1.4`）。**不再提供** `OPENCODE_CLI_VERSION` / `SDK_VERSION` 环境变量。
+- `config/config.yaml`（直接入库）、`config/opencode.json`（模板 `config/opencode.json.example`）一并打包进镜像。
+
+### 6.2 环境变量（部署相关 / 敏感）
+
+| 变量 | 默认 | 说明 |
+|:-----|:-----|:-----|
+| `PORT` | `10000` | 网关对外端口 |
+| `OPENCODE_SERVER_PORT` | `10001` | 后端端口（未设 `OPENCODE_SERVER_URL` 时生效） |
+| `OPENCODE_SERVER_URL` | 空 | 外部实例地址；设置后不拉起子进程，直接连接 |
+| `OPENCODE_SERVER_PASSWORD` | 空 | OpenCode server HTTP Basic 密码 |
+| `API_KEY_ENABLED` | `false` | 是否开启对外 API KEY 鉴权 |
+| `API_KEY` | 空 | 单 key |
+| `SEARCH_API_KEY` | 空 | 仅使用付费搜索后端时需要；默认免费后端无需 |
+| `CONFIG_PATH` | `./config/config.yaml` | 配置文件路径 |
+| `LOG_LEVEL` | `info` | 网关日志级别（fatal/error/warn/info/debug/trace/silent） |
+
+> 默认**尽量使用免费资源**：不配置付费模型 key、不使用付费搜索后端；`OPENCODE_API_KEYS`（多用户付费 key）不再作为配置项。
+
+### 6.3 config/config.yaml（业务默认值，直接入库、随镜像打包）
+
+> 不含敏感信息，无 example 模板；密钥只走环境变量（§6.2）。
+
+| 键 | 默认 | 说明 |
+|:---|:-----|:-----|
+| `models.auto.regex` | `[]` | auto 模式正则列表（仅作用于内置模型） |
+| `models.auto.exclude` | `[]` | 排除名单（国内不可用等） |
+| `models.auto.fallback` | 空 | 池为空时兜底模型 |
+| `models.aliases` | `{}` | 内置模型短名映射（可选） |
+| `ollama.aliases` | `{}` | `短名 → ollama/<id>` 映射（可选） |
+| `web_search.model` | 空 | web-search 默认内置模型 |
+| `web_search.synthesize_default` | `false` | 默认是否综合答案 |
+| `search.provider` | `duckduckgo` | 兜底搜索后端（默认免费） |
+| `search.base_url` | 空 | `custom` 后端地址（可选） |
+| `search.headers` | `{}` | `custom` 后端请求头（可选） |
+| `search.top_k` | `5` | 默认结果条数（API 可覆盖） |
+| `search.max_chars_per_page` | `4000` | 默认单页截断（API 可覆盖） |
+| `session.ttl_min` | `30` | 会话清理 TTL |
+
+> `top_k` / `max_chars_per_page` 已**移除环境变量**，改为 `config/config.yaml` 默认值 + API 请求参数覆盖。
+
+### 6.4 config/opencode.json（Ollama provider，随镜像打包）
+
+> 模板为 `config/opencode.json.example`；实际文件含本机地址，不入库（gitignored）。
+> 本地直跑时网关 spawn 的 `opencode serve` 只自动发现项目根 / 全局的 `opencode.json`，
+> 需以 `OPENCODE_CONFIG=./config/opencode.json` 指向本文件（Docker 内由镜像放到全局目录，无需该变量）。
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "ollama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Ollama (local)",
+      "options": { "baseURL": "http://host.docker.internal:11434/v1" },
+      "models": { "qwen3:4b": { "name": "Qwen3 4B (local)" } }
+    }
+  }
+}
+```
+
+- 实际推理走 OpenCode 的 `provider.ollama`；网关经 `model.list()` 读取已声明模型做校验与 `/v1/models` 展示。
+- `OLLAMA_BASE_URL` / `OLLAMA_MODELS` 环境变量**移除**，统一由该文件管理。
+
+---
+
+## 7. API 端点设计
+
+> 完整字段、请求/响应示例、SSE 事件序、错误码与 web-search 设计见 **[docs/api.md](./api.md)**。
+
+| 方法 | 路径 | 协议族 | 说明 |
+|:-----|:-----|:-------|:-----|
+| `GET` | `/health` | 自定义 | 健康检查（含后端连通性） |
+| `GET` | `/v1/models` | OpenAI | 模型列表（含虚拟模型 `auto` 与 Ollama 声明） |
+| `POST` | `/v1/chat/completions` | OpenAI | Chat Completions（SSE 流式） |
+| `POST` | `/v1/responses` | OpenAI | Responses API（SSE 流式） |
+| `POST` | `/v1/messages` | Anthropic | Messages API（兼容 Claude SDK，SSE 流式） |
+| `POST` | `/v1/web_search` | 自定义 | **独立 web-search API**（需指定内置模型） |
+
+- 推理三端点（`chat` / `responses` / `messages`）均支持 `model: "auto"`、`<provider>/<id>` 内置模型、以及 `ollama/<id>`。
+- **`web_search` 是独立 API**，不内嵌为工具；请求 `model` 必须为**内置模型**（拒绝 `auto` / `ollama/...`），可用 config/config.yaml `web_search.model` 设默认。
+- 模型命名与解析规则见 [api.md §7](./api.md)；端点细节见 [api.md §8](./api.md)。
+- 错误统一格式：`{ "error": { "message", "type", "code" } }`，常见 `401/400/502/503` 见 api.md §2.4。
+
+请求示例（节选，详见 api.md）：
+
+```bash
+# auto 模式 + 鉴权
+curl -X POST http://127.0.0.1:10000/v1/chat/completions \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"auto","messages":[{"role":"user","content":"你好"}],"stream":true}'
+```
+
+---
+
+## 8. 关键技术决策与风险
+
+| 风险 / 决策点 | 说明与对策 |
+|:-------------|:-----------|
+| **客户端与 serve 版本耦合** | `@opencode/client` 由 server OpenAPI 生成，必须在 Dockerfile 锁定 `@opencode/cli` 与 `@opencode/client` 同版本；跨版本字段直接对不上，不做多版本兼容。 |
+| **免费模型不固定 & 国内不可用** | 这是 `auto` 模式的立项动机；用正则 + 排除名单 + 随机 + TTL 缓存缓解。 |
+| **web-search 国内可用性** | 服务端 websearch 优先，兜底 `duckduckgo` 在国内不稳；生产建议 bing/brave 或国内代理，并在 README 标注。 |
+| **web-search 指定模型** | 独立 API 需绑定**内置模型**；config/config.yaml `web_search.model` 提供默认，避免 `auto`/Ollama 干扰链路。 |
+| **流式保真** | 2.x 以 `/api/event` SSE 事件流驱动；`session.text.delta` 转发增量，`wait` 后以最终助手消息全文对账补发（订阅窗口外丢失一次性补齐）。 |
+| **消息列表排序陷阱** | 2.x `message.list` 默认**新→旧**；适配层固定 `order:"asc"`（旧→新）后取末条 assistant，否则续接会话会取到旧轮结果。 |
+| **会话生命周期与并发** | OpenCode session 需按时清理；网关用 TTL 映射表（`session.ttl_min`）+ 用完即删（无续接语义的端点），避免后端堆积。 |
+| **内置免费模型鉴权** | 2.x `opencode/*-free` 模型免登录、cost=0，无需 `/connect`；仅 Ollama 等自定义 provider 需在 `config/opencode.json` 配置。 |
+| **工具结果体积** | web-search 段落需截断（config/config.yaml `search.max_chars_per_page`，请求 `max_chars_per_page` 可覆盖），防止上下文溢出。 |
+
+---
+
+## 9. 实施里程碑（建议）
+
+1. **M1 骨架**：进程管理 + 客户端适配层 + `/health` + `/v1/models`，跑通「显式模型推理」。
+2. **M2 协议**：完整 Chat Completions / Responses 的 SSE 流式转换。
+3. **M3 auto 模式**：正则池 + 排除 + 随机 + TTL 缓存。
+4. **M4 Ollama**：配置化声明与映射。
+5. **M5 web-search 独立 API**：内置模型驱动 + 兜底 SearchProvider + 段落抽取。
+6. **M6 鉴权与运维**：API KEY、多用户 key、Docker、面板/指标（可选）。
+
+---
+
+## 10. 参考资源
+
+- OpenCode 仓库（2.x）：https://github.com/anomalyco/opencode
+- OpenCode 官方文档（Server / SDK）：https://opencode.ai/docs/server 、https://opencode.ai/docs/sdk
+- OpenCode 中文文档：https://open-code.ai/zh/docs/sdk
+- Ollama provider 配置：https://opencode.ai/docs/providers
+- 原项目（衍生来源）：https://github.com/TiaraBasori/OpenCode2API
+- OpenAI API 规范（Chat Completions / Responses）：https://platform.openai.com/docs/api-reference

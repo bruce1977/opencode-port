@@ -1,0 +1,14 @@
+node_modules/
+coverage/
+output/
+logs/
+.temp/
+
+# 本地实际配置（不入库；config/config.yaml 与 .env.example 对应的模板直接入库）
+.env
+config/opencode.json
+
+# OpenCode 本地数据与缓存
+.opencode/
+*.log
+.DS_Store
