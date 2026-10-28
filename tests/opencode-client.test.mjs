@@ -1,5 +1,5 @@
-// 后端适配层单测：注入 fake fetch 模拟 opencode serve 2.x（/api/* 路由 + /api/event SSE），
-// 覆盖健康探测、模型列表、阻塞 prompt、流式 promptStream（事件增量 + 差量补发）、websearch、中止。
+// Backend adapter unit tests: fake fetch emulates opencode serve 2.x (/api/* routes + /api/event SSE),
+// covering health probing, model listing, blocking prompt, streaming promptStream (event deltas + tail catch-up), websearch and abort.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createBackendClient, normalizeAssistant } from "../src/core/opencode-client.mjs";
@@ -15,10 +15,10 @@ function jsonResponse(body, status = 200) {
 }
 
 /**
- * 模拟 opencode serve 2.x：
- * - GET /api/event 返回 SSE 流，state.sse.push(event) 推帧；
- * - POST .../wait 在 waitDelayMs 后返回（期间先把 deltas 推入事件流）；
- * - 其余按方法/路径返回固定 JSON，全部调用记入 calls。
+ * Emulates opencode serve 2.x:
+ * - GET /api/event returns an SSE stream; state.sse.push(event) emits a frame;
+ * - POST .../wait resolves after waitDelayMs (deltas are pushed to the event stream first);
+ * - everything else returns fixed JSON per method/path; all calls are recorded in calls.
  */
 function createFakeBackend({ assistant, deltas = [], waitDelayMs = 5, infoStatus = 200, extraMessages = [] } = {}) {
   const calls = [];
@@ -42,7 +42,7 @@ function createFakeBackend({ assistant, deltas = [], waitDelayMs = 5, infoStatus
       if (infoStatus !== 200) {
         return jsonResponse({ _tag: "UnauthorizedError", message: "Authentication required" }, infoStatus);
       }
-      return jsonResponse({ version: "2.1.4", pid: 1, urls: ["http://127.0.0.1:10001"], paths: { tmp: "/tmp" } });
+      return jsonResponse({ version: "2.2.0", pid: 1, urls: ["http://127.0.0.1:10001"], paths: { tmp: "/tmp" } });
     }
 
     if (method === "GET" && path === "/api/model") {
@@ -70,29 +70,29 @@ function createFakeBackend({ assistant, deltas = [], waitDelayMs = 5, infoStatus
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
         },
       };
-      // 模拟真实 fetch：signal 中止时 body 读取失败
+      // like real fetch: reading the body fails once the signal is aborted
       init.signal?.addEventListener("abort", () => {
         try {
           controller.error(new Error("aborted"));
         } catch {
-          // 流可能已关闭
+          // the stream may already be closed
         }
       }, { once: true });
       return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
     }
 
     if (method === "POST" && path === "/api/session") {
-      // session.create 客户端会解包 .data
+      // the session.create client unwraps .data
       return jsonResponse({ data: { id: SESSION_ID, title: "fake", model: body?.model ?? null, location: { directory: "/app" } } });
     }
 
     if (method === "POST" && path === `/api/session/${SESSION_ID}/prompt`) {
-      // session.prompt 客户端会解包 .data
+      // the session.prompt client unwraps .data
       return jsonResponse({ data: { id: "msg_user_1", type: "user", delivery: "steer" } });
     }
 
     if (method === "POST" && path === `/api/experimental/session/${SESSION_ID}/wait`) {
-      // wait 期间推送文本增量（模拟服务端边生成边发事件）
+      // push text deltas while waiting (the server emits events as it generates)
       for (const [ordinal, delta] of deltas.entries()) {
         state.sse?.push({
           type: "session.text.delta",
@@ -109,7 +109,7 @@ function createFakeBackend({ assistant, deltas = [], waitDelayMs = 5, infoStatus
     }
 
     if (method === "GET" && path === `/api/session/${SESSION_ID}/message`) {
-      // 模拟真实服务端：默认新→旧（desc），order=asc 时旧→新
+      // like the real server: newest-first (desc) by default, oldest-first when order=asc
       const all = [...extraMessages, assistant].filter(Boolean);
       const order = url.searchParams.get("order") ?? "desc";
       const sorted = order === "asc" ? all : [...all].reverse();
@@ -171,7 +171,7 @@ test("health/getServerInfo：200 返回 ServerInfo，401 视为不可用", async
   const client = createBackendClient({ baseUrl: "http://127.0.0.1:10001", password: "pw", fetch: ok.fetchImpl });
   assert.equal(await client.health(), true);
   const info = await client.getServerInfo();
-  assert.equal(info.version, "2.1.4");
+  assert.equal(info.version, "2.2.0");
 
   const denied = createFakeBackend({ infoStatus: 401 });
   const client2 = createBackendClient({ baseUrl: "http://127.0.0.1:10001", password: "wrong", fetch: denied.fetchImpl });
@@ -226,7 +226,7 @@ test("promptStream：逐个收到 delta，最终文本以消息为准对账补�
   const client = createBackendClient({ baseUrl: "http://127.0.0.1:10001", fetch: fake.fetchImpl });
   const deltas = [];
   const result = await client.promptStream({ sessionId: SESSION_ID, text: "hi", onDelta: (d) => deltas.push(d) });
-  // 增量转发 + 差量补发（缺尾部「世界」）
+  // incremental forwarding + catch-up of the missing tail ("世界")
   assert.deepEqual(deltas, ["你好", "，", "世界"]);
   assert.equal(result.text, "你好，世界");
 });
@@ -243,7 +243,7 @@ test("promptStream：忽略其他会话的 delta 事件", async () => {
   const fake = createFakeBackend({ assistant: makeAssistant() });
   const client = createBackendClient({ baseUrl: "http://127.0.0.1:10001", fetch: fake.fetchImpl });
   const deltas = [];
-  // 订阅建立后由 wait 推送（本用例 deltas 为空），另手动推一条他会话事件
+  // pushed by wait once subscribed (this case has no deltas); plus one manual event from another session
   const promise = client.promptStream({ sessionId: SESSION_ID, text: "hi", onDelta: (d) => deltas.push(d) });
   await new Promise((resolve) => setTimeout(resolve, 1));
   fake.state.sse?.push({ type: "session.text.delta", data: { sessionID: "ses_other", assistantMessageID: "x", ordinal: 0, delta: "别会话" } });
@@ -253,7 +253,7 @@ test("promptStream：忽略其他会话的 delta 事件", async () => {
 });
 
 test("prompt：续接会话取最新 assistant（多轮历史按 asc 排序，不取到旧轮）", async () => {
-  // 模拟续接会话：旧轮 assistant（"OK"）在前，新轮 assistant（"靛蓝色"）在后；服务端默认 desc 返回
+  // continuation session: previous assistant turn ("OK") first, new turn ("靛蓝色") last; the server replies desc by default
   const oldTurn = { id: "msg_old", type: "assistant", content: [{ type: "text", text: "OK" }], finish: "stop", tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } } };
   const newTurn = makeAssistant({ content: [{ type: "text", text: "靛蓝色" }] });
   const fake = createFakeBackend({ assistant: newTurn, extraMessages: [oldTurn] });
@@ -283,13 +283,13 @@ test("promptStream：助手消息内嵌 error 时抛 502 upstream_error", async 
   );
 });
 
-test("外部 signal 中止：抛「推理已中止」", async () => {
+test("external signal abort: throws \"inference aborted\"", async () => {
   const fake = createFakeBackend({ assistant: makeAssistant(), waitDelayMs: 60000 });
   const client = createBackendClient({ baseUrl: "http://127.0.0.1:10001", fetch: fake.fetchImpl });
   const controller = new AbortController();
   const promise = client.promptStream({ sessionId: SESSION_ID, text: "hi", onDelta: () => {}, signal: controller.signal });
   setTimeout(() => controller.abort(), 10);
-  await assert.rejects(() => promise, /推理已中止/);
+  await assert.rejects(() => promise, /inference aborted/);
 });
 
 test("webSearch / listWebSearchProviders：服务端一等公民透传", async () => {
@@ -300,7 +300,7 @@ test("webSearch / listWebSearchProviders：服务端一等公民透传", async (
   const out = await client.webSearch({ query: "opencode" });
   assert.equal(out.providerID, "exa");
   assert.equal(out.results[0].url, "https://example.com/a");
-  // 未指定 providerID 时不带该字段（服务端自选）
+  // omit providerID when not given (the server picks one)
   const call = fake.calls.find((c) => c.path === "/api/websearch");
   assert.equal(call.body.providerID, undefined);
   assert.equal(call.body.query, "opencode");

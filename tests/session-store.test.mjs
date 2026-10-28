@@ -1,4 +1,4 @@
-// 会话映射存储单测：link/get/TTL 过期与 onExpire 通知（design.md §5.4）。
+// Session store unit tests: link/get, TTL expiry and onExpire notification (design.md §5.4).
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createSessionStore } from "../src/core/session-store.mjs";
@@ -13,7 +13,7 @@ test("link：无 key 自动生成，有 key 则覆盖续接", () => {
     const named = store.link("resp_custom", "ses_b");
     assert.equal(named, "resp_custom");
     assert.equal(store.get("resp_custom"), "ses_b");
-    // 续接：同 key 换 session
+    // continuation: same key, new session
     store.link("resp_custom", "ses_c");
     assert.equal(store.get("resp_custom"), "ses_c");
   } finally {
@@ -37,7 +37,7 @@ test("TTL 过期：get 触发 onExpire 并返回 null", async () => {
     store.link("resp_x", "ses_x");
     assert.equal(store.get("resp_x"), null);
     assert.deepEqual(expired, ["ses_x"]);
-    // 过期后条目已被删除，重复 get 不再触发 onExpire
+    // the entry is deleted on expiry, so a repeated get must not fire onExpire again
     assert.equal(store.get("resp_x"), null);
     assert.equal(expired.length, 1);
   } finally {

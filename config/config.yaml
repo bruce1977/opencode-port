@@ -1,30 +1,36 @@
-# 业务默认值，随镜像打包（通过 CONFIG_PATH 指定，默认 ./config/config.yaml）
-# 直接入库，不含任何敏感信息（密钥只走环境变量，见 AGENTS.md §5）
+# Business defaults, packaged into the image (located via CONFIG_PATH, default ./config/config.yaml)
+# Committed to the repository and free of secrets (keys only via environment variables, see AGENTS.md §5)
 
 models:
+  # Allow list: a full model name (provider/model) must match one of these regexes to appear in /v1/models;
+  # auto also picks at random only from the built-in models that match. An empty list means no filtering.
+  allow:
+    - '^(?:opencode/(?:big-pickle|(?:deepseek|glm|mimo)-v\d+\.\d+(?:-flash)?-free)|ollama-local(?:/.*)?)$'
   auto:
-    # auto 模式：仅对“内置模型”（opencode/*-free 系列）做正则匹配后随机选一款
-    regex:
-      - '^opencode/(?:big-pickle|(?:deepseek|glm|mimo)-v\d+\.\d+(?:-flash)?-free)$'
-    exclude: []            # 排除名单（国内不可用 / 不稳定）
-    fallback: ""           # 池为空时的兜底模型（内置模型 ID，如 opencode/flint-40b-free）
-  aliases: {}              # 内置模型短名映射，如 { flint: "opencode/flint-40b-free" }
+    exclude: []                               # exclusion list (unavailable / unstable), removed from the auto pool
+    fallback: "opencode/big-pickle"           # fallback when the pool is empty (built-in model id, e.g. opencode/flint-40b-free)
+  aliases: {
+    "big-pickle":"opencode/big-pickle",
+    "deepseek-v4.1-flash":"opencode/deepseek-v4.1-flash-free",
+  }              # short-name map for built-in models, e.g. { flint: "opencode/flint-40b-free" }
 
 ollama:
-  # 短名 → ollama/<id>，如 { qwen: "ollama/qwen3:4b" }
-  # 注意：Ollama 模型本体须在 config/opencode.json 的 provider.ollama.models 声明
+  # short name -> ollama/<id>, e.g. { qwen: "ollama/qwen3:4b" }
+  # note: the Ollama models themselves must be declared in provider.ollama.models of config/opencode.json
   aliases: { "qwen3.5":"ollama-local/qwen3.5:9b" }
 
 web_search:
-  model: "ollama-local/qwen3.5:9b"   # 必须是内置模型（web-search 独立 API 的默认 model；仅 synthesize=true 时驱动模型）
-  synthesize_default: false          # 默认是否用该内置模型综合答案
+  # optional explicit default model (aliases supported); when empty, uses the first ollama-local/*, else models.auto.fallback
+  model: ""
+  synthesize_default: false          # whether that model synthesizes the answer by default
 
 search:
-  provider: "duckduckgo"   # 默认免费后端；可选 bing / brave / custom
-  base_url: ""             # custom 后端地址
-  headers: {}              # custom 后端请求头
-  top_k: 5                 # 默认结果条数（API 请求参数可覆盖）
-  max_chars_per_page: 4000 # 默认单页截断（API 请求参数可覆盖）
+  # fallback search backend: duckduckgo / bing are free and need no key; brave needs SEARCH_API_KEY; custom is a self-hosted gateway
+  provider: "duckduckgo"
+  base_url: ""             # custom backend base URL
+  headers: {}              # custom backend request headers
+  top_k: 5                 # default number of results (overridable per API request)
+  max_chars_per_page: 4000 # default per-page truncation (overridable per API request)
 
 session:
   ttl_min: 30

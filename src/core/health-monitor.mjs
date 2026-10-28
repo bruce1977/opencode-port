@@ -1,16 +1,17 @@
-// 运行期自测：周期性调用网关自己的 GET /health，确认「网关 → opencode serve」链路仍然通。
-// 只做观测，不负责重启后端（子进程退出的重启由 server-manager 负责，design.md §5.1）。
+// Runtime self-test: periodically calls the gateway's own GET /health to confirm the
+// "gateway → opencode serve" chain is still working.
+// Observation only; it never restarts the backend (server-manager owns subprocess restarts, design.md §5.1).
 const DEFAULT_INTERVAL_MS = 60000;
 const SELF_TEST_TIMEOUT_MS = 10000;
 
 /**
- * 启动周期性 /health 自测。
+ * Start the periodic /health self-test.
  * @param {object} options
- * @param {string} options.url 网关 /health 地址（如 http://127.0.0.1:10000/health）
- * @param {number} [options.intervalMs] 间隔，默认 60s
- * @param {string} [options.apiKey] API_KEY_ENABLED 开启时的 Bearer key（/health 也在鉴权后）
+ * @param {string} options.url gateway /health URL (e.g. http://127.0.0.1:10000/health)
+ * @param {number} [options.intervalMs] interval, default 60s
+ * @param {string} [options.apiKey] Bearer key when API_KEY_ENABLED is on (/health is also guarded)
  * @param {{ info: Function, warn: Function }} options.logger
- * @param {typeof globalThis.fetch} [options.fetch] 注入用（测试传假 fetch）
+ * @param {typeof globalThis.fetch} [options.fetch] injection for tests (fake fetch)
  * @returns {{ stop: () => void }}
  */
 export function startHealthSelfTest({
@@ -39,7 +40,7 @@ export function startHealthSelfTest({
 
       if (!response.ok) {
         consecutiveFailures += 1;
-        logger.warn({ status: response.status, latencyMs, consecutiveFailures }, "自测未通过：/health 返回非 2xx");
+        logger.warn({ status: response.status, latencyMs, consecutiveFailures }, "self-test failed: /health returned non-2xx");
         return;
       }
 
@@ -47,7 +48,7 @@ export function startHealthSelfTest({
       try {
         body = await response.json();
       } catch {
-        // /health 响应不是 JSON：下面按 degraded 处理，不因解析失败中断定时器
+        // /health body is not JSON: handled as degraded below, parsing failure must not kill the timer
       }
 
       if (body?.status === "ok") {
@@ -59,7 +60,7 @@ export function startHealthSelfTest({
             backendVersion: body.opencode?.version ?? null,
             latencyMs,
           },
-          "自测通过：/health",
+          "self-test passed: /health",
         );
         return;
       }
@@ -72,12 +73,12 @@ export function startHealthSelfTest({
           latencyMs,
           consecutiveFailures,
         },
-        "自测未通过：后端不健康",
+        "self-test failed: backend unhealthy",
       );
     } catch (error) {
-      if (stopped) return; // stop() 主动中止：不是失败
+      if (stopped) return; // aborted by stop(): not a failure
       consecutiveFailures += 1;
-      logger.warn({ err: error, consecutiveFailures }, "自测失败：/health 请求异常");
+      logger.warn({ err: error, consecutiveFailures }, "self-test failed: /health request error");
     } finally {
       clearTimeout(timeout);
       activeController = null;

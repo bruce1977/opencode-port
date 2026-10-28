@@ -1,5 +1,5 @@
-// 兜底搜索后端（api.md §9.1）：duckduckgo（默认免费）/ bing / brave / custom。
-// 所有出站请求均带超时 + AbortSignal（AGENTS.md §4.3）。
+// Fallback search backends (api.md §9.1): duckduckgo (free by default) / bing / brave / custom.
+// Every outbound request carries a timeout and AbortSignal (AGENTS.md §4.3).
 import { upstreamError } from "../core/errors.mjs";
 
 const REQUEST_TIMEOUT_MS = 10000;
@@ -41,23 +41,23 @@ const decodeEntities = (text) => text
 
 const stripTags = (html) => decodeEntities(String(html).replace(/<[^>]*>/g, "")).replace(/\s+/g, " ").trim();
 
-/** DuckDuckGo HTML 版（无需 key）：解析 result__a / result__snippet */
+/** DuckDuckGo HTML endpoint (no key required): parse result__a / result__snippet */
 async function searchDuckDuckGo({ query, topK, locale }) {
   const params = new URLSearchParams({ q: query, kl: locale || "wt-wt" });
   const { ok, text, error } = await fetchText(`https://html.duckduckgo.com/html/?${params}`);
-  if (!ok) throw upstreamError(`duckduckgo 检索失败：${error?.message ?? "未知错误"}`);
+  if (!ok) throw upstreamError(`duckduckgo search failed: ${error?.message ?? "no details"}`);
   const hits = [];
   const anchorRe = /<a[^>]+class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
   const snippetRe = /<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
   const anchors = [];
   let match;
   while ((match = anchorRe.exec(text)) !== null && anchors.length < topK) {
-    // DDG 跳转链接带 uddg 参数，解出真实 URL
+    // DDG redirect links carry an uddg parameter; decode the real URL
     let url = match[1];
     try {
       const parsed = new URL(url, "https://duckduckgo.com");
       url = parsed.searchParams.get("uddg") ? decodeURIComponent(parsed.searchParams.get("uddg")) : url;
-    } catch { /* 保底用原链接 */ }
+    } catch { /* Keep the original link as a fallback */ }
     anchors.push({ url, title: stripTags(match[2]) });
   }
   const snippets = [];
@@ -70,11 +70,11 @@ async function searchDuckDuckGo({ query, topK, locale }) {
   return hits;
 }
 
-/** Bing HTML 版：解析 <li class="b_algo"> 结果块 */
+/** Bing HTML endpoint: parse <li class="b_algo"> result blocks */
 async function searchBing({ query, topK, locale }) {
   const params = new URLSearchParams({ q: query, count: String(topK), setlang: locale || "en" });
   const { ok, text, error } = await fetchText(`https://www.bing.com/search?${params}`);
-  if (!ok) throw upstreamError(`bing 检索失败：${error?.message ?? "未知错误"}`);
+  if (!ok) throw upstreamError(`bing search failed: ${error?.message ?? "no details"}`);
   const hits = [];
   const blockRe = /<li class="b_algo"[\s\S]*?<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?(?:<p[^>]*>([\s\S]*?)<\/p>)?[\s\S]*?<\/li>/g;
   let match;
@@ -84,19 +84,19 @@ async function searchBing({ query, topK, locale }) {
   return hits;
 }
 
-/** Brave Search API（需 SEARCH_API_KEY） */
+/** Brave Search API (requires SEARCH_API_KEY) */
 async function searchBrave({ query, topK, locale, apiKey }) {
-  if (!apiKey) throw upstreamError("brave 后端需要设置 SEARCH_API_KEY");
+  if (!apiKey) throw upstreamError("the brave backend requires SEARCH_API_KEY");
   const params = new URLSearchParams({ q: query, count: String(topK), search_lang: locale || "en" });
   const { ok, text, error } = await fetchText(`https://api.search.brave.com/res/v1/web/search?${params}`, {
     headers: { Accept: "application/json", "X-Subscription-Token": apiKey },
   });
-  if (!ok) throw upstreamError(`brave 检索失败：${error?.message ?? "未知错误"}`);
+  if (!ok) throw upstreamError(`brave search failed: ${error?.message ?? "no details"}`);
   let data;
   try {
     data = JSON.parse(text);
   } catch {
-    throw upstreamError("brave 响应不是合法 JSON");
+    throw upstreamError("brave responded with invalid JSON");
   }
   return (data?.web?.results ?? []).slice(0, topK).map((item) => ({
     title: item.title ?? "",
@@ -105,17 +105,17 @@ async function searchBrave({ query, topK, locale, apiKey }) {
   }));
 }
 
-/** custom：自建网关，约定 GET base_url?q=&count=&lang= 返回 [{title,url,snippet}] 或 {results:[…]} */
+/** custom: a self-hosted gateway; the contract is GET base_url?q=&count=&lang= returning [{title,url,snippet}] or {results:[…]} */
 async function searchCustom({ query, topK, locale, baseUrl, headers }) {
-  if (!baseUrl) throw upstreamError("custom 后端需要配置 search.base_url");
+  if (!baseUrl) throw upstreamError("the custom backend requires search.base_url");
   const params = new URLSearchParams({ q: query, count: String(topK), lang: locale || "en" });
   const { ok, text, error } = await fetchText(`${baseUrl}?${params}`, { headers });
-  if (!ok) throw upstreamError(`custom 检索失败：${error?.message ?? "未知错误"}`);
+  if (!ok) throw upstreamError(`custom search failed: ${error?.message ?? "no details"}`);
   let data;
   try {
     data = JSON.parse(text);
   } catch {
-    throw upstreamError("custom 后端响应不是合法 JSON");
+    throw upstreamError("the custom backend responded with invalid JSON");
   }
   const list = Array.isArray(data) ? data : (data?.results ?? []);
   return list.slice(0, topK).map((item) => ({
@@ -126,12 +126,12 @@ async function searchCustom({ query, topK, locale, baseUrl, headers }) {
 }
 
 /**
- * 按配置构造 SearchProvider（api.md §9.1 的接口约定）。
+ * Build a SearchProvider from config (interface contract in api.md §9.1).
  * @returns {{ name: string, search: (args: { query: string, topK: number, locale?: string }) => Promise<SearchHit[]> }}
  */
 export function createSearchProvider({ config, searchApiKey, logger }) {
   const base = { provider: config.search.provider, topK: config.search.topK };
-  logger?.debug(base, "使用兜底搜索后端");
+  logger?.debug(base, "Using fallback search backend");
 
   const impl = {
     duckduckgo: searchDuckDuckGo,

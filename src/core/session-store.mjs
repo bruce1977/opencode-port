@@ -1,10 +1,10 @@
-// 会话映射：客户端 conversation/session 概念 ↔ OpenCode session.id，带 TTL 清理（design.md §5.4）。
+// Session mapping: client conversation/session concepts <-> OpenCode session.id, with TTL cleanup (design.md §5.4).
 import { randomBytes } from "node:crypto";
 
 /**
  * @param {object} options
- * @param {number} options.ttlMs 会话存活时间
- * @param {(sessionId: string) => void | Promise<void>} [options.onExpire] 过期时通知后端清理
+ * @param {number} options.ttlMs session time-to-live
+ * @param {(sessionId: string) => void | Promise<void>} [options.onExpire] notified on expiry so the backend session can be cleaned up
  */
 export function createSessionStore({ ttlMs, onExpire }) {
   /** @type {Map<string, { sessionId: string, expiresAt: number }>} */
@@ -19,6 +19,7 @@ export function createSessionStore({ ttlMs, onExpire }) {
     if (!hit) return null;
     if (hit.expiresAt <= Date.now()) {
       map.delete(key);
+      // expiry cleanup is best-effort: a failed backend delete must not break the lookup
       void Promise.resolve(onExpire?.(hit.sessionId)).catch(() => {});
       return null;
     }
@@ -29,7 +30,7 @@ export function createSessionStore({ ttlMs, onExpire }) {
     map.set(key, { sessionId, expiresAt: Date.now() + ttlMs });
   }
 
-  /** 新建一对 (key, sessionId)，或续接已有 key */
+  /** Create a new (key, sessionId) pair, or continue an existing key */
   function link(key, sessionId) {
     const effective = key ?? newKey();
     set(effective, sessionId);
@@ -41,6 +42,7 @@ export function createSessionStore({ ttlMs, onExpire }) {
     for (const [key, hit] of map) {
       if (hit.expiresAt <= now) {
         map.delete(key);
+        // expiry cleanup is best-effort: a failed backend delete must not abort the sweep
         void Promise.resolve(onExpire?.(hit.sessionId)).catch(() => {});
       }
     }

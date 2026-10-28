@@ -1,27 +1,27 @@
-// SDK 适配层：封装 @opencode/client（2.x Promise 客户端，版本与 @opencode/cli 锁定一致），
-// 向上层提供归一化接口并统一错误（design.md §5.2）。
-// 注意：SDK 与 opencode serve 版本必须一致，升级时两边同步（AGENTS.md §6）。
+// SDK adapter layer: wraps @opencode/client (2.x Promise client, version-locked with @opencode/cli)
+// and exposes a normalized interface upward with unified errors (design.md §5.2).
+// Note: the SDK and opencode serve versions must match; upgrade both together (AGENTS.md §6).
 //
-// 2.x 与 1.x 的关键差异（迁移依据，已实测）：
-// - 客户端工厂为 OpenCode.make({ baseUrl, headers, fetch? })，失败以 Error 抛出（name=_tag 或 ClientError）；
-// - 健康探测走 GET /api/info（返回 { version, pid, urls, paths }）；
-// - 模型是一等公民：model.list() 直接返回 ModelInfo[]（不再嵌在 provider 里）；
-// - session.prompt 为异步投递（返回 inbox 回执），需 session.wait() 等待执行结束；
-// - 无 per-prompt system：改用 session.instructions.entry.put({ key, value }) 注入；
-// - 流式增量为独立事件 session.text.delta（data.delta），session.text.ended 带权威全文可对账；
-// - 助手结果消息为 content:[{type:text|reasoning|tool}] + finish（OpenAI 风格枚举）+ tokens + cost。
+// Key differences between 2.x and 1.x (migration basis, verified in practice):
+// - Client factory is OpenCode.make({ baseUrl, headers, fetch? }); failures throw Error (name=_tag or ClientError);
+// - Health probe uses GET /api/info (returns { version, pid, urls, paths });
+// - Models are first-class: model.list() returns ModelInfo[] directly (no longer nested in providers);
+// - session.prompt is async dispatch (returns an inbox receipt); call session.wait() to wait for completion;
+// - No per-prompt system: inject via session.instructions.entry.put({ key, value });
+// - Streaming deltas are a dedicated event session.text.delta (data.delta); session.text.ended carries the authoritative full text for reconciliation;
+// - Assistant result messages are content:[{type:text|reasoning|tool}] + finish (OpenAI-style enum) + tokens + cost.
 import { OpenCode } from "@opencode/client";
-import { upstreamError } from "./errors.mjs";
+import { promptUpstreamError, upstreamError } from "./errors.mjs";
 
-const PROMPT_TIMEOUT_MS = 300000; // 单次推理最长 5 分钟（agent 任务可能较慢）
+const PROMPT_TIMEOUT_MS = 300000; // max 5 minutes per inference (agent tasks can be slow)
 const HEALTH_TIMEOUT_MS = 5000;
 const MODEL_LIST_TIMEOUT_MS = 15000;
 
 /**
  * @param {object} options
- * @param {string} options.baseUrl opencode serve 地址
- * @param {string} options.password OPENCODE_SERVER_PASSWORD（HTTP Basic，用户名固定 opencode）
- * @param {typeof globalThis.fetch} [options.fetch] 注入用（测试传假 fetch）
+ * @param {string} options.baseUrl opencode serve address
+ * @param {string} options.password OPENCODE_SERVER_PASSWORD (HTTP Basic, username fixed to opencode)
+ * @param {typeof globalThis.fetch} [options.fetch] for injection (tests pass a fake fetch)
  */
 export function createBackendClient({ baseUrl, password, fetch: fetchImpl }) {
   const headers = {};
@@ -30,13 +30,13 @@ export function createBackendClient({ baseUrl, password, fetch: fetchImpl }) {
   }
   const client = OpenCode.make(fetchImpl ? { baseUrl, headers, fetch: fetchImpl } : { baseUrl, headers });
 
-  /** 2.x 失败统一为 Error：业务错误 name 为 _tag（如 UnauthorizedError），传输错误为 ClientError */
+  /** 2.x failures are uniformly Error: business errors use name=_tag (e.g. UnauthorizedError), transport errors are ClientError */
   function fail(action, error) {
     const detail = error?.message ?? String(error);
-    throw upstreamError(`${action}失败：${detail}`);
+    throw upstreamError(`${action} failed: ${detail}`);
   }
 
-  /** 健康探测：成功返回 ServerInfo（{version,pid,urls,paths}），失败返回 null */
+  /** Health probe: returns ServerInfo ({version,pid,urls,paths}) on success, null on failure */
   async function getServerInfo() {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), HEALTH_TIMEOUT_MS);
@@ -54,7 +54,7 @@ export function createBackendClient({ baseUrl, password, fetch: fetchImpl }) {
     return Boolean(await getServerInfo());
   }
 
-  /** 模型列表（含内置免费模型与已配置 provider 的模型，已禁用/废弃的剔除在 resolver 做） */
+  /** Model list (built-in free models plus configured provider models; disabled/deprecated ones are dropped in the resolver) */
   async function listModels() {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), MODEL_LIST_TIMEOUT_MS);
@@ -63,35 +63,35 @@ export function createBackendClient({ baseUrl, password, fetch: fetchImpl }) {
       return out?.data ?? [];
     } catch (error) {
       if (controller.signal.aborted) {
-        throw upstreamError(`读取模型列表超时（>${MODEL_LIST_TIMEOUT_MS / 1000}s）`);
+        throw upstreamError(`model list timed out (>${MODEL_LIST_TIMEOUT_MS / 1000}s)`);
       }
-      fail("读取模型列表", error);
+      fail("model list", error);
     } finally {
       clearTimeout(timer);
     }
   }
 
-  /** 服务端 websearch 后端目录（exa/tavily/...，api.md §9） */
+  /** Server-side websearch backend catalog (exa/tavily/..., api.md §9) */
   async function listWebSearchProviders() {
     try {
       const out = await client.websearch.providers();
       return out?.data ?? [];
     } catch (error) {
-      fail("读取 websearch 后端", error);
+      fail("websearch provider catalog", error);
     }
   }
 
-  /** 服务端 websearch 检索；不指定 providerID 时由服务端选择已配置后端 */
+  /** Server-side websearch query; when providerID is omitted the server picks a configured backend */
   async function webSearch({ query, providerID }) {
     try {
       const out = await client.websearch.query(providerID ? { query, providerID } : { query });
       return out?.data ?? { providerID: "", results: [] };
     } catch (error) {
-      fail("websearch 检索", error);
+      fail("websearch query", error);
     }
   }
 
-  /** 建会话：2.x 支持创建时直接绑定模型/agent */
+  /** Create a session: 2.x can bind the model/agent at creation time */
   async function createSession({ model, agent, title } = {}) {
     try {
       const input = {};
@@ -100,7 +100,7 @@ export function createBackendClient({ baseUrl, password, fetch: fetchImpl }) {
       if (title) input.title = title;
       return await client.session.create(input);
     } catch (error) {
-      fail("创建会话", error);
+      fail("session create", error);
     }
   }
 
@@ -108,7 +108,7 @@ export function createBackendClient({ baseUrl, password, fetch: fetchImpl }) {
     try {
       await client.session.remove({ sessionID: sessionId });
     } catch {
-      // 清理会话失败不影响主流程（后端可能已在重启）
+      // session cleanup failure does not affect the main flow (backend may be restarting)
     }
   }
 
@@ -116,49 +116,49 @@ export function createBackendClient({ baseUrl, password, fetch: fetchImpl }) {
     try {
       await client.session.interrupt({ sessionID: sessionId });
     } catch {
-      // 会话可能已结束
+      // session may already have ended
     }
   }
 
-  /** 续接会话时对齐模型（2.x 模型绑定在会话上） */
+  /** Align the model when continuing a session (2.x binds the model to the session) */
   async function switchModel(sessionId, model) {
     try {
       await client.session.switchModel({ sessionID: sessionId, model });
     } catch (error) {
-      fail("切换模型", error);
+      fail("model switch", error);
     }
   }
 
-  /** system 指令注入（2.x 无 per-prompt system，用 instructions entry 承载） */
+  /** system instruction injection (2.x has no per-prompt system; carried by an instructions entry) */
   async function putInstruction(sessionId, key, value) {
     try {
       await client.session.instructions.entry.put({ sessionID: sessionId, key, value });
     } catch (error) {
-      fail("写入 system 指令", error);
+      fail("system instructions write", error);
     }
   }
 
   /**
-   * 会话消息列表（user/assistant/idle 等 SessionMessageInfo）。
-   * 2.x 默认按新→旧返回，这里固定 order=asc（旧→新），
-   * 保证「最后一条 assistant」就是最新结果（requireAssistant 依赖该顺序）。
+   * Session message list (user/assistant/idle etc. as SessionMessageInfo).
+   * 2.x returns newest→oldest by default; we pin order=asc (oldest→newest)
+   * so that "the last assistant message" is the latest result (requireAssistant relies on that order).
    */
   async function getMessages(sessionId) {
     try {
       const out = await client.message.list({ sessionID: sessionId, order: "asc" });
       return out?.data ?? [];
     } catch (error) {
-      fail("读取消息", error);
+      fail("message read", error);
     }
   }
 
   /**
-   * 阻塞式推理（非流式端点用）：prompt → wait → 读最终助手消息。
+   * Blocking inference (for non-streaming endpoints): prompt → wait → read the final assistant message.
    * @param {object} options
    * @param {string} options.sessionId
-   * @param {string} options.text 单段提示文本（历史折叠已由上层完成）
-   * @param {Array<{ uri: string }>} [options.files] 图片附件（data: URI）
-   * @param {string} [options.system] system 指令（经 instructions entry 注入）
+   * @param {string} options.text single-segment prompt text (history folding is already done upstream)
+   * @param {Array<{ uri: string }>} [options.files] image attachments (data: URI)
+   * @param {string} [options.system] system instruction (injected via an instructions entry)
    * @param {AbortSignal} [options.signal]
    * @returns {Promise<NormalizedAssistant>}
    */
@@ -177,10 +177,10 @@ export function createBackendClient({ baseUrl, password, fetch: fetchImpl }) {
       await client.session.wait({ sessionID: sessionId }, { signal: controller.signal });
       return await requireAssistant(sessionId);
     } catch (error) {
-      if (timedOut) throw upstreamError(`推理超时（>${PROMPT_TIMEOUT_MS / 1000}s）`);
-      if (controller.signal.aborted) throw upstreamError("推理已中止");
+      if (timedOut) throw upstreamError(`inference timed out (>${PROMPT_TIMEOUT_MS / 1000}s)`);
+      if (controller.signal.aborted) throw upstreamError("inference aborted");
       if (error?.name === "ApiError") throw error;
-      fail("推理请求", error);
+      fail("inference request", error);
     } finally {
       clearTimeout(timer);
       externalSignal?.removeEventListener("abort", onExternalAbort);
@@ -188,10 +188,11 @@ export function createBackendClient({ baseUrl, password, fetch: fetchImpl }) {
   }
 
   /**
-   * 流式推理：先订阅事件桥接 session.text.delta，再 prompt → wait，
-   * 结束后以最终助手消息对账补发差量（订阅窗口外丢失的开头文本一次性补齐）。
+   * Streaming inference: subscribe first to bridge session.text.delta, then prompt → wait;
+   * after completion, reconcile against the final assistant message and emit any missing delta
+   * (leading text lost outside the subscription window is back-filled in one go).
    * @param {object} options
-   * @param {(delta: string) => void} options.onDelta 文本增量回调
+   * @param {(delta: string) => void} options.onDelta text delta callback
    * @returns {Promise<NormalizedAssistant>}
    */
   async function promptStream({ sessionId, text, files, system, onDelta, signal: externalSignal }) {
@@ -207,7 +208,7 @@ export function createBackendClient({ baseUrl, password, fetch: fetchImpl }) {
     let emitted = "";
     let closed = false;
 
-    // 后台消费事件流：只关心本会话的文本增量（delta 事件 data 里带 sessionID）
+    // Background event-stream consumer: only cares about text deltas for this session (delta event data carries sessionID)
     const consume = (async () => {
       try {
         for await (const event of client.event.subscribe({ signal: controller.signal })) {
@@ -221,7 +222,7 @@ export function createBackendClient({ baseUrl, password, fetch: fetchImpl }) {
           }
         }
       } catch {
-        // 流中断：最终结果仍从最终消息取，不影响正确性
+        // stream interrupted: the final result still comes from the final message, so correctness is unaffected
       }
     })();
 
@@ -233,9 +234,9 @@ export function createBackendClient({ baseUrl, password, fetch: fetchImpl }) {
       controller.abort();
       await consume;
       const result = await requireAssistant(sessionId);
-      if (result.error) throw upstreamError(`推理失败：${result.error}`);
+      if (result.error) throw promptUpstreamError(result.error);
 
-      // 差量补发：以最终文本为准，补齐订阅窗口外丢失的开头/结尾
+      // Delta back-fill: trust the final text and emit whatever was lost outside the subscription window (head/tail)
       if (!result.text.startsWith(emitted)) {
         onDelta(result.text);
       } else if (result.text.length > emitted.length) {
@@ -246,24 +247,24 @@ export function createBackendClient({ baseUrl, password, fetch: fetchImpl }) {
       closed = true;
       controller.abort();
       await consume;
-      if (timedOut) throw upstreamError(`推理超时（>${PROMPT_TIMEOUT_MS / 1000}s）`);
-      if (controller.signal.aborted && externalSignal?.aborted) throw upstreamError("推理已中止");
+      if (timedOut) throw upstreamError(`inference timed out (>${PROMPT_TIMEOUT_MS / 1000}s)`);
+      if (controller.signal.aborted && externalSignal?.aborted) throw upstreamError("inference aborted");
       if (error?.name === "ApiError") throw error;
-      fail("推理请求", error);
+      fail("inference request", error);
     } finally {
       clearTimeout(timer);
       externalSignal?.removeEventListener("abort", onExternalAbort);
     }
   }
 
-  /** 2.x prompt 入参：文本 + data: URI 附件 */
+  /** 2.x prompt input: text + data: URI attachments */
   function promptInput(sessionId, text, files) {
     const input = { sessionID: sessionId, text };
     if (Array.isArray(files) && files.length > 0) input.files = files;
     return input;
   }
 
-  /** 取最后一条助手消息并归一化；找不到时结合 session.outcome 给出可诊断错误 */
+  /** Take the last assistant message and normalize it; when absent, produce a diagnosable error from session.outcome */
   async function requireAssistant(sessionId) {
     const messages = await getMessages(sessionId);
     for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -274,9 +275,9 @@ export function createBackendClient({ baseUrl, password, fetch: fetchImpl }) {
     try {
       outcome = (await client.session.get({ sessionID: sessionId }))?.outcome ?? "unknown";
     } catch {
-      // 读取会话状态失败不影响主错误信息
+      // failing to read session state does not affect the primary error message
     }
-    throw upstreamError(`推理未返回助手消息（session.outcome=${outcome}）`);
+    throw upstreamError(`inference returned no assistant message (session.outcome=${outcome})`);
   }
 
   return {
@@ -300,16 +301,16 @@ export function createBackendClient({ baseUrl, password, fetch: fetchImpl }) {
 /**
  * @typedef {object} NormalizedAssistant
  * @property {string} messageId
- * @property {string} text 拼接后的纯文本（跳过 reasoning/tool）
- * @property {string} reasoning 拼接后的思考文本
+ * @property {string} text concatenated plain text (reasoning/tool skipped)
+ * @property {string} reasoning concatenated thinking text
  * @property {Array<{ id: string, name: string, state: string, input: unknown, output: string, error: string|null }>} tools
- * @property {string} finish OpenCode finish 枚举（stop/length/tool-calls/content-filter/error/unknown）
+ * @property {string} finish OpenCode finish enum (stop/length/tool-calls/content-filter/error/unknown)
  * @property {{ input: number, output: number, reasoning: number, cache: { read: number, write: number } } | null} tokens
  * @property {number} cost
- * @property {string|null} error 消息内嵌错误文本（如 ProviderAuthError）
+ * @property {string|null} error error text embedded in the message (e.g. ProviderAuthError)
  */
 
-/** 助手消息（SessionMessageAssistant）→ 归一化结构 */
+/** Assistant message (SessionMessageAssistant) → normalized structure */
 export function normalizeAssistant(message) {
   const content = Array.isArray(message.content) ? message.content : [];
   const text = content.filter((item) => item.type === "text").map((item) => item.text ?? "").join("");
@@ -334,14 +335,14 @@ export function normalizeAssistant(message) {
   };
 }
 
-/** SessionStructuredError（{type,message,status?}）→ "type: message"（无则 null） */
+/** SessionStructuredError ({type,message,status?}) → "type: message" (null when absent) */
 function structuredErrorText(error) {
   if (!error) return null;
   const message = typeof error.message === "string" ? error.message : JSON.stringify(error);
   return error.type ? `${error.type}: ${message}` : message;
 }
 
-/** 工具 completed/error 状态里的文本内容拼接（content: [{type:"text",text}|{type:"file",...}]） */
+/** Concatenate text content from a tool's completed/error state (content: [{type:"text",text}|{type:"file",...}]) */
 function toolOutputText(state) {
   if (!Array.isArray(state?.content)) return "";
   return state.content

@@ -1,9 +1,9 @@
-// web-search 独立 API 单测：服务端 websearch 优先 / 兜底 SearchProvider / synthesize / 截断与错误（api.md §8/§9）。
+// Unit tests for the standalone web-search API: server-side websearch priority / fallback SearchProvider / synthesize / truncation and errors (api.md §8/§9).
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { runWebSearch } from "../src/tools/web-search.mjs";
 
-// 长段落（>30 字，过滤短文本门槛）与带实体的 HTML
+// Long paragraphs (over the 30-character threshold for filtering short text) and HTML containing entities
 const LONG_A = "OpenCode 是一个开源的 AI 编程助手框架，支持多种模型与工具编排能力。".repeat(2);
 const LONG_B = "网关把 OpenCode 的内置免费模型包装成 OpenAI 与 Anthropic 兼容接口。".repeat(2);
 
@@ -16,20 +16,25 @@ const DDG_HTML = [
 function makeCtx(overrides = {}) {
   const config = {
     search: { provider: "duckduckgo", baseUrl: "", headers: {}, topK: 5, maxCharsPerPage: 4000 },
-    webSearch: { model: "opencode/flint-40b-free", synthesizeDefault: false },
+    webSearch: { model: "", synthesizeDefault: false },
     searchApiKey: "",
+  };
+  const resolveBuiltinOnly = async (name) => {
+    if (name === "auto" || name.startsWith("ollama/")) {
+      const error = new Error("invalid model");
+      error.status = 400;
+      error.code = "invalid_model";
+      throw error;
+    }
+    return { providerID: "opencode", modelID: "flint-40b-free", name: "opencode/flint-40b-free" };
   };
   const ctx = {
     config,
-    logger: { warn() {}, debug() {}, error() {} },
-    resolver: { resolveBuiltinOnly: async (name) => {
-      if (name === "auto" || name.startsWith("ollama/")) {
-        const error = new Error("invalid model");
-        error.status = 400;
-        throw error;
-      }
-      return { providerID: "opencode", modelID: "flint-40b-free", name: "opencode/flint-40b-free" };
-    } },
+    logger: { info() {}, warn() {}, debug() {}, error() {} },
+    resolver: {
+      resolveBuiltinOnly,
+      resolveWebSearchModel: async (name) => resolveBuiltinOnly(name ?? "opencode/flint-40b-free"),
+    },
     client: {
       webSearch: async () => ({ providerID: "exa", results: [{ url: "https://example.com/a", title: "A", content: "服务端摘要", time: {} }] }),
       createSession: async () => ({ id: "ses_1" }),
@@ -41,7 +46,7 @@ function makeCtx(overrides = {}) {
   return ctx;
 }
 
-/** 临时替换全局 fetch（fetchParagraphs / SearchProvider 均走全局 fetch），返回还原函数 */
+/** Temporarily replace global fetch (fetchParagraphs / SearchProvider both use global fetch); returns a restore function */
 function stubFetch(handler) {
   const original = globalThis.fetch;
   globalThis.fetch = handler;
@@ -185,13 +190,13 @@ test("抓取失败但有 snippet：以 snippet 兜底成段落", async () => {
   }
 });
 
-test("query 缺失 / model 缺失 → 400", async () => {
+test("query 缺失 → 400 invalid_request", async () => {
   await assert.rejects(
-    () => runWebSearch(makeCtx(), { model: "opencode/flint-40b-free", query: "  " }),
+    () => runWebSearch(makeCtx(), { query: "  " }),
     (error) => error.status === 400 && error.code === "invalid_request",
   );
   await assert.rejects(
-    () => runWebSearch(makeCtx(), { model: "", query: "q" }),
-    (error) => error.status === 400 && error.code === "invalid_model",
+    () => runWebSearch(makeCtx(), { model: "opencode/flint-40b-free" }),
+    (error) => error.status === 400 && error.code === "invalid_request",
   );
 });

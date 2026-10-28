@@ -1,10 +1,12 @@
-// POST /v1/responses：OpenAI Responses API，SSE 流式，支持 previous_response_id 续接（api.md §5）。
-// 2.x 续接语义：会话本身保留上下文，续接时用 switchModel 对齐模型（模型绑定在会话上）。
+// POST /v1/responses: OpenAI Responses API with SSE streaming and previous_response_id continuation (api.md §5).
+// 2.x continuation semantics: the session itself keeps the context; on continuation switchModel aligns the model (the model is bound to the session).
 import { z } from "zod";
-import { badRequest, upstreamError } from "../../core/errors.mjs";
+import { badRequest, promptUpstreamError } from "../../core/errors.mjs";
 import { startSse } from "../sse.mjs";
+import { toJsonSchema } from "../openapi.mjs";
 import { inputToMessages, messagesToPrompt, newId, responsesObject } from "../protocol.mjs";
 import { clientAbortSignal, runPrompt, runStreamPrompt } from "../inference.mjs";
+import { logUsage } from "../../core/usage.mjs";
 
 const bodySchema = z.object({
   model: z.string().default("auto"),
@@ -13,8 +15,38 @@ const bodySchema = z.object({
   previous_response_id: z.string().optional(),
 });
 
+const responseSchema = {
+  type: "object",
+  additionalProperties: true,
+  properties: {
+    id: { type: "string" },
+    object: { type: "string", enum: ["response"] },
+    created_at: { type: "integer" },
+    model: { type: "string" },
+    status: { type: "string" },
+    output: { type: "array", items: { type: "object", additionalProperties: true } },
+    usage: {
+      type: "object",
+      additionalProperties: true,
+      properties: {
+        input_tokens: { type: "integer" },
+        output_tokens: { type: "integer" },
+      },
+    },
+  },
+};
+
 export function registerResponseRoutes(app, { ctx }) {
-  app.post("/v1/responses", async (request, reply) => {
+  app.post("/v1/responses", {
+    schema: {
+      tags: ["responses"],
+      summary: "Responses API",
+      description:
+        "OpenAI Responses API。stream=true 时按 response.created → output_text.delta → response.completed 事件序输出 SSE；previous_response_id 可续接会话。",
+      body: toJsonSchema(bodySchema),
+      response: { 200: responseSchema },
+    },
+  }, async (request, reply) => {
     const parsed = bodySchema.safeParse(request.body);
     if (!parsed.success) {
       throw badRequest(`请求体不合法：${parsed.error.issues.map((i) => `${i.path.join(".")} ${i.message}`).join("; ")}`);
@@ -26,16 +58,18 @@ export function registerResponseRoutes(app, { ctx }) {
 
     const resolved = await ctx.resolver.resolve(body.model);
     const id = newId("resp_");
+    const startedAt = Date.now();
 
-    // 续接：previous_response_id → 已有 OpenCode session；新建则记录映射供下次续接
+    // Continuation: previous_response_id → an existing OpenCode session; a freshly created one is recorded for the next continuation
     const previousId = body.previous_response_id;
     const existingSession = previousId ? ctx.sessions.get(previousId) : null;
     if (previousId && !existingSession) {
-      request.log.warn({ previous_response_id: previousId }, "previous_response_id 不存在或已过期，将开启新会话");
+      request.log.warn({ previous_response_id: previousId }, "previous_response_id not found or expired, starting a new session");
     }
 
     if (!body.stream) {
       const result = await runPromptPreserving({ ctx, resolved, prompt, system: prompt.system, existingSession });
+      logUsage(ctx.logger, { endpoint: "/v1/responses", model: result.model, stream: false, startedAt, result });
       ctx.sessions.link(id, result.sessionId);
       return responsesObject({ id, model: result.model, text: result.text, tokens: result.tokens });
     }
@@ -67,6 +101,7 @@ export function registerResponseRoutes(app, { ctx }) {
         signal,
         onDelta: (delta) => send("response.output_text.delta", { item_id: msgId, output_index: 0, content_index: 0, delta }),
       });
+      logUsage(ctx.logger, { endpoint: "/v1/responses", model: result.model, stream: true, startedAt, result });
       ctx.sessions.link(id, result.sessionId);
       send("response.output_text.done", { item_id: msgId, output_index: 0, content_index: 0, text: result.text });
       send("response.output_item.done", {
@@ -85,9 +120,9 @@ export function registerResponseRoutes(app, { ctx }) {
       sse.send(null, "[DONE]");
     } catch (error) {
       if (signal.aborted) {
-        ctx.logger.warn({ model: resolved.name }, "客户端断开，推理中止");
+        ctx.logger.warn({ model: resolved.name }, "client disconnected, inference aborted");
       } else {
-        // SSE 已开始，用流内 error 事件表达失败（api.md §2.4）
+        // SSE has started; express the failure as an in-stream error event (api.md §2.4)
         send("error", { code: error.code ?? "upstream_error", message: error.message });
         sse.send(null, "[DONE]");
       }
@@ -98,12 +133,12 @@ export function registerResponseRoutes(app, { ctx }) {
   });
 }
 
-// 续接语义：复用已有 session（会话保留给下一轮），否则新建并保留
+// Continuation semantics: reuse the existing session (kept for the next turn), otherwise create one and keep it
 async function runPromptPreserving({ ctx, resolved, prompt, system, existingSession }) {
   if (existingSession) {
     await ctx.client.switchModel(existingSession, { providerID: resolved.providerID, id: resolved.modelID });
     const result = await ctx.client.prompt({ sessionId: existingSession, text: prompt.text, files: prompt.files, system });
-    if (result.error) throw upstreamError(`推理失败：${result.error}`);
+    if (result.error) throw promptUpstreamError(result.error);
     return { ...result, model: resolved.name, sessionId: existingSession };
   }
   return runPrompt({ ctx, resolved, prompt, system, keepSession: true });
@@ -120,7 +155,7 @@ async function runStreamPromptPreserving({ ctx, resolved, prompt, system, existi
       onDelta,
       signal,
     });
-    if (result.error) throw upstreamError(`推理失败：${result.error}`);
+    if (result.error) throw promptUpstreamError(result.error);
     return { ...result, model: resolved.name, sessionId: existingSession };
   }
   return runStreamPrompt({ ctx, resolved, prompt, system, signal, onDelta, keepSession: true });

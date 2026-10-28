@@ -1,0 +1,6 @@
+# Keys accepted when API_KEY_ENABLED=true. One plaintext key per line, used exactly as written:
+# no encryption, no hashing, no {env:VAR} interpolation. Blank lines and # comments are ignored.
+# This file is a secret: config/.keys is gitignored and dockerignored, and reaches the container
+# through the read-only ./config mount (override the path with API_KEYS_FILE).
+#
+# sk-replace-me

@@ -13,6 +13,7 @@
 |:-----|:-----|
 | `GET /health` | 健康检查（含后端连通性） |
 | `GET /v1/models` | 模型列表（含虚拟模型 `auto`） |
+| `GET /v1/aliases` | 模型别名列表（`models.aliases` / `ollama.aliases`） |
 | `POST /v1/chat/completions` | OpenAI Chat Completions（SSE） |
 | `POST /v1/responses` | OpenAI Responses API（SSE） |
 | `POST /v1/messages` | Anthropic Messages API（SSE） |
@@ -34,7 +35,7 @@
 | 后端 SDK | `@opencode/client`，**版本锁定且必须与镜像内 `@opencode/cli` 同版本** |
 
 - 类型提示用 JSDoc（可选，可加 `// @ts-check`），不得因此引入 `tsc` 或打包器。
-- 运行期依赖保持在 4 个以内；新增依赖需要说明「为什么标准库/Fastify 自带能力不够」。
+- 运行期依赖保持在 6 个以内（在原有 4 个基础上增加 `@fastify/swagger` / `@fastify/swagger-ui`：Fastify 自身不生成 OpenAPI 文档与 UI，手写静态规范会与路由 schema 形成第二套事实源）；新增依赖需要说明「为什么标准库/Fastify 自带能力不够」。
 
 ---
 
@@ -48,7 +49,8 @@ src/api/routes/      协议层：health / models / chat / responses / messages /
 src/tools/           检索实现：服务端 websearch 优先 + SearchProvider 兜底
 scripts/             一次性运维与自检脚本（与源码同一套 lint 规则）
 tests/               node:test 用例，命名 *.test.mjs
-config/              业务默认值与工具配置（config.yaml 直接入库；opencode.json.example 模板；eslint.config.mjs）
+config/              业务默认值与工具配置（config.yaml 直接入库；opencode.json.example 与 .keys.example 是模板；eslint.config.mjs；
+                     实际 opencode.json 与 .keys 不入库）
 docs/                设计文档与 API 契约
 ```
 
@@ -104,19 +106,23 @@ docs/                设计文档与 API 契约
 
 | 层 | 载体 | 只放 | 不放 |
 |:---|:-----|:-----|:-----|
-| 版本 | `Dockerfile` 的 `ARG` + `package.json`/lock | `@opencode/cli` 与 `@opencode/client` 版本 | 用户可调项 |
-| 部署/敏感 | 环境变量（`.env`，模板 `.env.example`） | 端口、后端地址、`OPENCODE_SERVER_PASSWORD`、`API_KEY`、`SEARCH_API_KEY`、`CONFIG_PATH`、`LOG_LEVEL` | 业务默认值 |
-| 业务默认值 | `config/config.yaml`（直接入库，随镜像打包） | `models.auto.*`、`models.aliases`、`ollama.aliases`、`web_search.*`、`search.*`、`session.ttl_min` | 任何密钥 |
-| Provider | `config/opencode.json`（模板 `config/opencode.json.example`，实际文件不入库） | `provider.ollama` 的 baseURL 与模型声明 | 业务逻辑 |
+| 版本 | `Dockerfile` 的 `ARG` + `package.json`/lock | `@opencode/cli` 与 `@opencode/client` 版本；非敏感部署项的镜像内默认值（`PORT` / `OPENCODE_SERVER_PORT` / `LOG_LEVEL` / `CONFIG_PATH`，运行期可覆盖） | 任何密钥、业务默认值（`API_KEY_ENABLED` / `API_KEYS_FILE` 即使非敏感也不写进 `ENV`，BuildKit 会按**名字**含 `API_KEY` 报密钥告警） |
+| 部署/敏感 | 环境变量（`.env`，模板 `.env.example`） | 端口、后端地址、`OPENCODE_SERVER_PASSWORD`、`API_KEY`、`API_KEYS_FILE`、`SEARCH_API_KEY`、`CONFIG_PATH`、`LOG_LEVEL`，以及透传给 `opencode serve` 的 provider 密钥（`OLLAMA_API_KEY`、`TAVILY_API_KEY`…） | 业务默认值 |
+| 对外凭据清单 | `config/.keys`（模板 `config/.keys.example`，**一行一个 key**；实际文件不入库、不进镜像） | 开启 `API_KEY_ENABLED` 后要接受的 key | 业务默认值、任何注释以外的字段 |
+| 业务默认值 | `config/config.yaml`（直接入库，随镜像打包） | `models.allow`、`models.auto.*`、`models.aliases`、`ollama.aliases`、`web_search.*`、`search.*`、`session.ttl_min` | 任何密钥 |
+| Provider | `config/opencode.json`（模板 `config/opencode.json.example`，实际文件不入库） | `provider.ollama` 的 baseURL 与模型声明、`websearch.provider` 声明 | 业务逻辑、明文密钥（一律写成 `{env:VAR}` 插值） |
 
-- 密钥只走环境变量：**不进 `config/`、不进镜像层、不进日志、不进错误响应**。
+- 密钥默认只走环境变量：**不进 `config/`、不进镜像层、不进日志、不进错误响应**。
+  唯一例外是 `config/.keys`：它是**运行期凭据清单**（一行一个对外 API key，**明文存、明文比**——不加解密、不哈希、不做 `{env:VAR}` 插值），
+  由 `.gitignore` + `.dockerignore` 双重排除、只通过 `./config` 只读挂载或本机文件提供；模板 `.keys.example` 才入库。
+  除该文件外，任何密钥仍一律走环境变量；key 值不得出现在日志、错误响应与镜像层里（与 `OPENCODE_SERVER_PASSWORD` 同级要求）。
 - 新增配置键必须**四处同步**：`config/config.yaml`、代码内默认值、`README.md` 配置表、`docs/design.md` §6。
 
 ---
 
 ## 6. 版本耦合（最容易踩）
 
-- `@opencode/client` 版本必须与镜像内 `@opencode/cli` **同版本**（当前 `2.1.4`）。client 由 server 的 OpenAPI 规范生成（路由前缀 `/api/*`），跨版本会直接对不上字段。
+- `@opencode/client` 版本必须与镜像内 `@opencode/cli` **同版本**（当前 `2.2.0`）。client 由 server 的 OpenAPI 规范生成（路由前缀 `/api/*`），跨版本会直接对不上字段。
 - 升级顺序：`Dockerfile` 的 `ARG OPENCODE_CLI_VERSION` → `package.json` 依赖版本 → `npm install` 更新 lock → `npm run check` → 接真实 `opencode serve` 冒烟（`/v1/models` + 一次流式 chat）。
 - **`package-lock.json` 必须提交**：`Dockerfile` 使用 `npm ci`，没有 lock 直接构建失败。
 
@@ -137,7 +143,7 @@ docs/                设计文档与 API 契约
 ## 8. 提交前自检清单
 
 - [ ] `npm run check` 通过（lint 零 error、零新增 warning，测试通过）
-- [ ] diff 中没有 `.env`、`config/opencode.json`、任何密钥（`config/config.yaml` 本身入库，但不得含密钥）
+- [ ] diff 中没有 `.env`、`config/opencode.json`、`config/.keys`、任何密钥（`config/config.yaml` 本身入库，但不得含密钥）
 - [ ] 新增/修改的端点与字段已进 `docs/api.md`
 - [ ] 新增配置键已四处同步
 - [ ] 手动冒烟：`/health` → `/v1/models` → 一次 `stream:true` 的 chat

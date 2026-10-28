@@ -1,11 +1,11 @@
-// 协议转换：OpenCode 消息 → OpenAI Chat / OpenAI Responses / Anthropic Messages 三家格式。
-// 纯函数，便于单测（api.md §4/§5/§6 的响应示例）。
+// Protocol conversion: OpenCode messages → OpenAI Chat / OpenAI Responses / Anthropic Messages formats.
+// Pure functions, easy to unit test (response examples in api.md §4/§5/§6).
 import { randomBytes } from "node:crypto";
 
 export const nowSec = () => Math.floor(Date.now() / 1000);
 export const newId = (prefix) => `${prefix}${randomBytes(12).toString("hex")}`;
 
-/** OpenCode tokens 统计 → OpenAI usage（缺失则全 0，api.md §4） */
+/** OpenCode tokens accounting → OpenAI usage (all zeros when missing, api.md §4) */
 export function toOpenAiUsage(tokens) {
   if (!tokens) return { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
   const prompt = (tokens.input ?? 0) + (tokens.cache?.read ?? 0);
@@ -22,7 +22,7 @@ export function toSplitUsage(tokens) {
   };
 }
 
-/** OpenAI 非流式 chat.completion */
+/** OpenAI non-streaming chat.completion */
 export function chatCompletion({ id, model, text, tokens, finishReason = "stop" }) {
   return {
     id,
@@ -40,7 +40,7 @@ export function chatCompletion({ id, model, text, tokens, finishReason = "stop" 
   };
 }
 
-/** OpenAI 流式 chunk；role 仅首个 chunk 携带（api.md §4）；created 由调用方固定保证同响应一致 */
+/** OpenAI streaming chunk; role is sent only on the first chunk (api.md §4); created is pinned by the caller so one response stays consistent */
 export function chatChunk({ id, model, delta, finishReason = null, tokens, created = nowSec() }) {
   const chunk = {
     id,
@@ -53,7 +53,7 @@ export function chatChunk({ id, model, delta, finishReason = null, tokens, creat
   return chunk;
 }
 
-/** Responses 非流式对象（api.md §5） */
+/** Responses non-streaming object (api.md §5) */
 export function responsesObject({ id, model, text, tokens }) {
   return {
     id,
@@ -74,7 +74,7 @@ export function responsesObject({ id, model, text, tokens }) {
   };
 }
 
-/** Anthropic 非流式 message（api.md §6） */
+/** Anthropic non-streaming message (api.md §6) */
 export function anthropicMessage({ id, model, text, tokens, stopReason = "end_turn" }) {
   return {
     id,
@@ -87,7 +87,7 @@ export function anthropicMessage({ id, model, text, tokens, stopReason = "end_tu
   };
 }
 
-// 2.x finish 枚举（stop/length/tool-calls/content-filter/error/unknown）→ 各协议收尾字段
+// 2.x finish enum (stop/length/tool-calls/content-filter/error/unknown) → per-protocol terminal field
 const OPENAI_FINISH = {
   stop: "stop",
   length: "length",
@@ -116,9 +116,10 @@ export function toAnthropicStop(finish) {
 }
 
 /**
- * 把 OpenAI/Anthropic 对话 messages 归一化成「单段提示文本 + 附件 + system」。
- * 2.x 的 prompt 入参为单个 text 字符串（无 parts 数组），多轮历史折叠为带角色前缀的
- * 上下文段后与最后一条消息拼接（design.md §4.2）；图片附件转成 data: URI 供 files 透传。
+ * Normalize OpenAI/Anthropic conversation messages into "a single prompt text + attachments + system".
+ * The 2.x prompt input is a single text string (no parts array), so multi-turn history is folded into
+ * context segments with role prefixes and joined with the last message (design.md §4.2); image attachments
+ * become data: URIs passed through as files.
  * @param {Array<{ role: string, content: unknown }>} messages
  * @returns {{ system: string, text: string, files: Array<{ uri: string }> }}
  */
@@ -147,8 +148,8 @@ export function messagesToPrompt(messages) {
 }
 
 /**
- * content（字符串 / 块数组）→ 纯文本 + 图片 URI 列表。
- * 支持 OpenAI（{type:"image_url",image_url:{url}}）与 Anthropic（{type:"image",source:{type:"base64",media_type,data}}）两种图片块。
+ * content (string / block array) → plain text + list of image URIs.
+ * Supports both OpenAI ({type:"image_url",image_url:{url}}) and Anthropic ({type:"image",source:{type:"base64",media_type,data}}) image blocks.
  */
 export function extractContent(content) {
   if (typeof content === "string") return { text: content, images: [] };
@@ -175,7 +176,7 @@ export function extractContent(content) {
   return { text: texts.filter(Boolean).join("\n"), images };
 }
 
-/** Responses input（字符串或输入项数组）→ messages */
+/** Responses input (string or array of input items) → messages */
 export function inputToMessages(input) {
   if (typeof input === "string") return [{ role: "user", content: input }];
   if (!Array.isArray(input)) return [];
@@ -183,7 +184,7 @@ export function inputToMessages(input) {
   for (const item of input) {
     if (!item || typeof item !== "object") continue;
     if (typeof item.role === "string") {
-      // Responses API 的消息项为 {type:"message",role,content}；role 判定已覆盖无 type 的宽松形式
+      // Responses API message items are {type:"message",role,content}; matching on role also covers the loose form without type
       messages.push({ role: item.role, content: flattenContent(item.content ?? item.text) });
     } else if (item.type === "input_text" || item.type === "text") {
       messages.push({ role: "user", content: String(item.text ?? "") });
@@ -192,7 +193,7 @@ export function inputToMessages(input) {
   return messages;
 }
 
-/** Anthropic content（字符串或 [{type:"text",text}] 数组）→ 纯文本 */
+/** Anthropic content (string or [{type:"text",text}] array) → plain text */
 export function flattenContent(content) {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {

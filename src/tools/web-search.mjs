@@ -1,15 +1,17 @@
-// web-search 独立 API 实现（api.md §8/§9）：
-// 指定内置模型 → 优先 OpenCode 2.x 服务端一等公民 websearch.query()，失败则回退自实现 SearchProvider。
-// 输入关键词，返回匹配网页的段落文字（text），可选综合答案（answer，由 model 驱动）。
-import { badRequest, upstreamError } from "../core/errors.mjs";
+// Standalone web-search API implementation (api.md §8/§9):
+// Requires a built-in model → prefer the OpenCode 2.x server-side first-class websearch.query(),
+// falling back to the local SearchProvider on failure.
+// Takes keywords and returns paragraph text (text) from matching pages, plus an optional synthesized answer (answer, driven by model).
+import { badRequest, promptUpstreamError, upstreamError } from "../core/errors.mjs";
+import { logUsage } from "../core/usage.mjs";
 import { fetchParagraphs } from "./fetch-page.mjs";
 import { createSearchProvider } from "./search-providers.mjs";
 
 const SYNTHESIZE_TIMEOUT_MS = 60000;
 
 /**
- * 服务端 websearch（2.x 一等公民）：query → [{url,title,content}]，
- * 随后抓取原页补充段落（服务端 content 作为 snippet 兜底）。
+ * Server-side websearch (2.x first-class citizen): query → [{url,title,content}],
+ * then fetch the original pages to supplement paragraphs (server content is the snippet fallback).
  */
 async function serverSearch(ctx, { query, topK, maxCharsPerPage, providerID }) {
   const out = await ctx.client.webSearch({ query, providerID });
@@ -21,7 +23,7 @@ async function serverSearch(ctx, { query, topK, maxCharsPerPage, providerID }) {
   }));
 }
 
-/** 兜底路径：SearchProvider 检索 → 逐页抓取段落 */
+/** Fallback path: SearchProvider lookup → fetch paragraphs page by page */
 async function fallbackSearch(ctx, { query, topK, locale, maxCharsPerPage }) {
   const provider = createSearchProvider({ config: ctx.config, searchApiKey: ctx.config.searchApiKey, logger: ctx.logger });
   const hits = await provider.search({ query, topK, locale });
@@ -32,7 +34,7 @@ async function fallbackSearch(ctx, { query, topK, locale, maxCharsPerPage }) {
   return results.filter((item) => item.paragraphs.length > 0 || item.snippet);
 }
 
-/** synthesize=true 时：用同一内置模型把段落综合成答案（2.x：单 text prompt） */
+/** When synthesize=true: synthesize the paragraphs into an answer with the same built-in model (2.x: single text prompt) */
 async function synthesizeAnswer(ctx, { model, query, text }) {
   const session = await ctx.client.createSession({
     model: { providerID: model.providerID, id: model.modelID },
@@ -41,11 +43,13 @@ async function synthesizeAnswer(ctx, { model, query, text }) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), SYNTHESIZE_TIMEOUT_MS);
     try {
+      const startedAt = Date.now();
       const result = await ctx.client.prompt({
         sessionId: session.id,
         text: `以下是关于「${query}」的网页检索段落，请基于这些内容写一段综合回答，不要编造：\n\n${text}`,
       });
-      if (result.error) throw upstreamError(`综合答案生成失败：${result.error}`);
+      if (result.error) throw promptUpstreamError(result.error);
+      logUsage(ctx.logger, { endpoint: "/v1/web_search", model: model.name, stream: false, startedAt, result });
       return result.text.trim();
     } finally {
       clearTimeout(timer);
@@ -56,8 +60,8 @@ async function synthesizeAnswer(ctx, { model, query, text }) {
 }
 
 /**
- * 执行一次 web-search 请求（api.md §8 的完整语义）。
- * @returns {Promise<object>} §8.3 响应体
+ * Execute a single web-search request (full semantics from api.md §8).
+ * @returns {Promise<object>} §8.3 response body
  */
 export async function runWebSearch(ctx, params) {
   const {
@@ -73,22 +77,20 @@ export async function runWebSearch(ctx, params) {
   if (!query || typeof query !== "string" || !query.trim()) {
     throw badRequest("query 缺失或为空", "invalid_request");
   }
-  if (!requestedModel) {
-    throw badRequest("model 缺失：web-search 必须指定内置模型（或在 config.yaml 的 web_search.model 配置默认值）", "invalid_model");
-  }
-  const model = await ctx.resolver.resolveBuiltinOnly(requestedModel);
+  // Explicit model (aliases supported) → web_search.model → first ollama-local/* → models.auto.fallback
+  const model = await ctx.resolver.resolveWebSearchModel(requestedModel);
 
   const effectiveTopK = topK ?? ctx.config.search.topK;
   const effectiveMaxChars = maxCharsPerPage ?? ctx.config.search.maxCharsPerPage;
 
-  // 2.x：服务端 websearch 优先（服务端自选已配置后端）；失败回退自实现 SearchProvider（api.md §9.1）
+  // 2.x: prefer server-side websearch (server picks its configured backend); fall back to the local SearchProvider on failure (api.md §9.1)
   let results = null;
   let engine = null;
   try {
     results = await serverSearch(ctx, { query, topK: effectiveTopK, maxCharsPerPage: effectiveMaxChars });
     engine = "opencode-websearch";
   } catch (error) {
-    ctx.logger?.warn({ err: error }, "服务端 websearch 失败，回退兜底后端");
+    ctx.logger?.warn({ err: error }, "Server-side websearch failed, falling back to the local search backend");
   }
   if (!results) {
     results = await fallbackSearch(ctx, { query, topK: effectiveTopK, locale, maxCharsPerPage: effectiveMaxChars });
@@ -98,7 +100,7 @@ export async function runWebSearch(ctx, params) {
     throw upstreamError("检索无任何结果（服务端与兜底后端均失败或为空）");
   }
 
-  // 体积控制：逐页截断 + 整体 text 拼接（单页抓取截断或拼接超限均置 truncated）
+  // Size control: truncate per page and concatenate the overall text (truncated is set if a page was truncated or the concatenation exceeds the limit)
   let truncated = false;
   const normalized = results.map((item) => {
     let paragraphs = item.paragraphs;
@@ -107,7 +109,7 @@ export async function runWebSearch(ctx, params) {
       paragraphs = truncateParagraphs(paragraphs, effectiveMaxChars);
     }
     if (paragraphs.length === 0 && item.snippet) {
-      paragraphs = [item.snippet]; // 无段落时用摘要兜底，保证 text 非空
+      paragraphs = [item.snippet]; // Fall back to the snippet when there are no paragraphs, keeping text non-empty
     }
     return { title: item.title, url: item.url, snippet: item.snippet ?? "", paragraphs };
   });

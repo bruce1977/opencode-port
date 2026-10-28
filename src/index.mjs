@@ -1,5 +1,5 @@
-// 进程入口：装配配置 → 启动 Fastify → 拉起或连接 opencode serve → 注册路由与钩子 → 监听。
-// design.md §5：组件装配与生命周期（含优雅退出）。
+// Process entry point: assemble config → start Fastify → launch or connect to opencode serve → register routes and hooks → listen.
+// design.md §5: component wiring and lifecycle (including graceful shutdown).
 import Fastify from "fastify";
 import { loadConfig, loadDotEnv } from "./config.mjs";
 import { ApiError } from "./core/errors.mjs";
@@ -10,24 +10,42 @@ import { createSessionStore } from "./core/session-store.mjs";
 import { startHealthSelfTest } from "./core/health-monitor.mjs";
 import { writeModelCatalogue } from "./startup-report.mjs";
 import { createAuthHook } from "./api/auth.mjs";
+import { AJV_OPTIONS } from "./api/fastify-options.mjs";
+import { registerOpenApi } from "./api/openapi.mjs";
 import { registerHealthRoutes } from "./api/routes/health.mjs";
 import { registerModelsRoutes } from "./api/routes/models.mjs";
+import { registerAliasesRoutes } from "./api/routes/aliases.mjs";
 import { registerChatRoutes } from "./api/routes/chat.mjs";
 import { registerResponseRoutes } from "./api/routes/responses.mjs";
 import { registerMessagesRoutes } from "./api/routes/messages.mjs";
 import { registerWebSearchRoutes } from "./api/routes/web-search.mjs";
 
 async function main() {
-  // `npm start` / `npm run dev` 默认读取项目根 .env；已存在的真实环境变量优先（容器内无 .env 属正常）
+  // `npm start` / `npm run dev` load the project root .env by default; real environment variables win (no .env in a container is normal)
   const dotenvLoaded = loadDotEnv();
   const config = loadConfig();
 
   const app = Fastify({
     logger: { level: config.logLevel },
-    bodyLimit: 20 * 1024 * 1024, // 允许 base64 图片（Anthropic/OpenAI 图像块）
+    bodyLimit: 20 * 1024 * 1024, // allow base64 images (Anthropic/OpenAI image blocks)
+    ajv: AJV_OPTIONS,
   });
 
-  if (dotenvLoaded) app.log.info({ path: ".env" }, "已加载 .env");
+  if (dotenvLoaded) app.log.info({ path: ".env" }, "loaded .env");
+  // Keys status is reported on every start (path and count only, never the values — AGENTS.md §5):
+  // "auth is on but no key was loaded" otherwise looks exactly like a broken gateway
+  if (config.apiKeyEnabled) {
+    const fields = { keysFile: config.apiKeysFile, keysFileFound: config.apiKeysFileFound, keyCount: config.apiKeys.length };
+    if (config.apiKeys.length === 0) {
+      app.log.error(fields, "API key auth is enabled but no key was loaded, every request will get 401 (put one plaintext key per line in this file, template: config/.keys.example, or set API_KEY)");
+    } else if (!config.apiKeysFileFound) {
+      app.log.warn(fields, "API keys file not found, accepting the API_KEY environment variable only");
+    } else {
+      app.log.info(fields, "API key auth enabled");
+    }
+  } else if (!config.apiKeysFileFound) {
+    app.log.debug({ keysFile: config.apiKeysFile }, "API key auth disabled and no keys file present");
+  }
 
   const serverManager = createServerManager({ config, logger: app.log });
   const serverUrl = await serverManager.startServe();
@@ -40,9 +58,14 @@ async function main() {
 
   const ctx = { config, client, resolver, sessions, serverManager, logger: app.log };
 
-  app.addHook("preHandler", createAuthHook({ config }));
+  // Swagger / OpenAPI must be registered before business routes: the onRoute hook collects endpoint schemas from them
+  await registerOpenApi(app, { config });
 
-  // 统一对外错误：ApiError 按契约返回，未知异常不泄漏堆栈（api.md §2.4 / AGENTS.md §4.3）
+  // onRequest, not preHandler: Fastify validates the body before preHandler, so an unauthenticated
+  // caller would otherwise get a 400 schema error (free feedback about the request contract) instead of 401
+  app.addHook("onRequest", createAuthHook({ config }));
+
+  // Unified outward errors: ApiError follows the contract, unknown exceptions never leak stack traces (api.md §2.4 / AGENTS.md §4.3)
   app.setErrorHandler((error, request, reply) => {
     if (error instanceof ApiError) {
       reply.status(error.status).send(error.toResponse());
@@ -60,7 +83,7 @@ async function main() {
       reply.status(error.statusCode).send({ error: { message: error.message, type: "invalid_request_error", code: "invalid_request" } });
       return;
     }
-    request.log.error({ err: error }, "未预期异常");
+    request.log.error({ err: error }, "unexpected exception");
     reply.status(500).send({ error: { message: "网关内部错误", type: "server_error", code: "internal_error" } });
   });
 
@@ -70,44 +93,45 @@ async function main() {
 
   registerHealthRoutes(app, { ctx });
   registerModelsRoutes(app, { ctx });
+  registerAliasesRoutes(app, { ctx });
   registerChatRoutes(app, { ctx });
   registerResponseRoutes(app, { ctx });
   registerMessagesRoutes(app, { ctx });
   registerWebSearchRoutes(app, { ctx });
 
   await app.listen({ port: config.port, host: "0.0.0.0" });
-  app.log.info({ port: config.port, server: serverUrl }, "网关已启动");
+  app.log.info({ port: config.port, server: serverUrl, docs: "/docs" }, "gateway started");
 
-  // 启动后拉取一次完整模型清单（内置 + 自定义 provider）并输出到终端。
-  // 失败不阻塞网关启动：/health 会显示 degraded，后续请求仍可重试。
+  // Fetch the full model catalogue (built-in + custom providers) once after startup and print it to the terminal.
+  // Failure does not block startup: /health reports degraded and later requests can still retry.
   try {
     const catalogue = await resolver.listAll();
     writeModelCatalogue(process.stdout, catalogue);
   } catch (error) {
-    app.log.warn({ err: error }, "拉取可用模型失败（网关继续启动）");
+    app.log.warn({ err: error }, "failed to list available models (gateway keeps starting)");
   }
 
-  // 周期性自测：每 60s 调一次自己的 /health（含后端连通性）
+  // Periodic self-test: call our own /health (including backend connectivity) every 60s
   const selfTest = startHealthSelfTest({
     url: `http://127.0.0.1:${config.port}/health`,
     intervalMs: 60 * 1000,
     apiKey: config.apiKeyEnabled ? config.apiKey : "",
     logger: app.log,
   });
-  app.log.info({ intervalSec: 60, url: `http://127.0.0.1:${config.port}/health` }, "自测定时器已启动");
+  app.log.info({ intervalSec: 60, url: `http://127.0.0.1:${config.port}/health` }, "self-test timer started");
 
-  // 优雅退出：先停自测与网关，再停 opencode serve（design.md §4.1）
+  // Graceful shutdown: stop the self-test and the gateway first, then opencode serve (design.md §4.1)
   let closing = false;
   const shutdown = async (signal) => {
     if (closing) return;
     closing = true;
-    app.log.info({ signal }, "收到退出信号，开始优雅退出");
+    app.log.info({ signal }, "shutdown signal received, starting graceful shutdown");
     try {
       selfTest.stop();
       await app.close();
       await serverManager.stopServe();
     } catch (error) {
-      app.log.error({ err: error }, "优雅退出异常");
+      app.log.error({ err: error }, "error during graceful shutdown");
     } finally {
       process.exit(0);
     }
@@ -117,7 +141,7 @@ async function main() {
 }
 
 main().catch((error) => {
-  // 启动失败：此时 app.log 可能未装配，走 stderr（不向客户端输出，无泄漏面）
-  process.stderr.write(`网关启动失败：${error?.message ?? error}\n`);
+  // Startup failure: app.log may not be wired yet, so write to stderr (never to clients, no leak surface)
+  process.stderr.write(`Gateway failed to start: ${error?.message ?? error}\n`);
   process.exit(1);
 });

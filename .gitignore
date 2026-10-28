@@ -4,11 +4,13 @@ output/
 logs/
 .temp/
 
-# 本地实际配置（不入库；config/config.yaml 与 .env.example 对应的模板直接入库）
+# Actual local config (not committed; the templates config/config.yaml and .env.example are committed)
 .env
 config/opencode.json
+# Accepted API keys (one per line); template config/.keys.example is committed, the real file never is
+config/.keys
 
-# OpenCode 本地数据与缓存
+# OpenCode local data and cache
 .opencode/
 *.log
 .DS_Store

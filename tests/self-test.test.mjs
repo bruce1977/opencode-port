@@ -1,4 +1,4 @@
-// 自测定时器单测：成功/失败日志、Bearer 头、stop 后不再调用（不依赖真实端口）。
+// Self-test timer unit tests: success/failure logging, Bearer header, no calls after stop (no real ports needed).
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { startHealthSelfTest } from "../src/core/health-monitor.mjs";
@@ -33,7 +33,7 @@ test("自测成功：带 Bearer 头，记录 status/version，stop 后不再调�
     calls.push({ url, auth: new Headers(init.headers).get("authorization") });
     return new Response(JSON.stringify({
       status: "ok",
-      opencode: { healthy: true, version: "2.1.4" },
+      opencode: { healthy: true, version: "2.2.0" },
       uptime_sec: 1,
     }), { status: 200, headers: { "content-type": "application/json" } });
   };
@@ -50,7 +50,7 @@ test("自测成功：带 Bearer 头，记录 status/version，stop 后不再调�
     assert.equal(calls[0].url, "http://127.0.0.1:10000/health");
     assert.equal(calls[0].auth, "Bearer secret");
     assert.ok(logs.info.length >= 1);
-    assert.equal(logs.info[0].fields.backendVersion, "2.1.4");
+    assert.equal(logs.info[0].fields.backendVersion, "2.2.0");
     assert.equal(logs.warn.length, 0);
   } finally {
     monitor.stop();

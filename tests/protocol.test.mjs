@@ -1,4 +1,4 @@
-// 协议转换纯函数单测（api.md §4/§5/§6 的响应形状）。
+// Unit tests for the pure protocol conversion functions (response shapes in api.md §4/§5/§6).
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {

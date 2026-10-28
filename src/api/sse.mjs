@@ -1,7 +1,7 @@
-// SSE 写入辅助：统一三家协议（OpenAI chat / OpenAI responses / Anthropic）的流式写法。
-// 一旦开始写 SSE 就不能再改状态码（AGENTS.md §4.3），错误用流内事件表达。
+// SSE write helpers: one streaming implementation for all three protocols (OpenAI chat / OpenAI responses / Anthropic).
+// Once SSE writing starts the status code can no longer change (AGENTS.md §4.3); errors are expressed as in-stream events.
 
-/** 把 reply 切换到 SSE 模式并返回写入函数 */
+/** Switch reply into SSE mode and return the write functions */
 export function startSse(reply) {
   reply.raw.writeHead(200, {
     "Content-Type": "text/event-stream; charset=utf-8",
@@ -10,7 +10,7 @@ export function startSse(reply) {
     "X-Accel-Buffering": "no",
   });
   return {
-    /** @param {string} event 事件名（Anthropic 用；OpenAI 系留空） @param {unknown} data */
+    /** @param {string} event event name (used by Anthropic; left empty for the OpenAI family) @param {unknown} data */
     send(event, data) {
       const payload = typeof data === "string" ? data : JSON.stringify(data);
       let frame = "";

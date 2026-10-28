@@ -1,9 +1,11 @@
-// POST /v1/messages：Anthropic Messages API（兼容 Claude SDK），SSE 流式（api.md §6）。
+// POST /v1/messages: Anthropic Messages API (Claude SDK compatible) with SSE streaming (api.md §6).
 import { z } from "zod";
 import { badRequest } from "../../core/errors.mjs";
 import { startSse } from "../sse.mjs";
+import { toJsonSchema } from "../openapi.mjs";
 import { anthropicMessage, flattenContent, messagesToPrompt, newId, toAnthropicStop, toSplitUsage } from "../protocol.mjs";
 import { clientAbortSignal, rethrowInternal, runPrompt, runStreamPrompt } from "../inference.mjs";
+import { logUsage } from "../../core/usage.mjs";
 
 const bodySchema = z.object({
   model: z.string().default("auto"),
@@ -16,14 +18,54 @@ const bodySchema = z.object({
   stream: z.boolean().default(false),
 });
 
+const responseSchema = {
+  type: "object",
+  additionalProperties: true,
+  properties: {
+    id: { type: "string" },
+    type: { type: "string", enum: ["message"] },
+    role: { type: "string", enum: ["assistant"] },
+    model: { type: "string" },
+    content: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: true,
+        properties: {
+          type: { type: "string", enum: ["text"] },
+          text: { type: "string" },
+        },
+      },
+    },
+    stop_reason: { type: "string" },
+    usage: {
+      type: "object",
+      additionalProperties: true,
+      properties: {
+        input_tokens: { type: "integer" },
+        output_tokens: { type: "integer" },
+      },
+    },
+  },
+};
+
 export function registerMessagesRoutes(app, { ctx }) {
-  app.post("/v1/messages", async (request, reply) => {
+  app.post("/v1/messages", {
+    schema: {
+      tags: ["messages"],
+      summary: "Anthropic Messages",
+      description:
+        "Anthropic Messages API（兼容 Claude SDK，鉴权支持 Bearer 或 x-api-key）。stream=true 时按 message_start → content_block_delta → message_stop 事件序输出 SSE。",
+      body: toJsonSchema(bodySchema),
+      response: { 200: responseSchema },
+    },
+  }, async (request, reply) => {
     const parsed = bodySchema.safeParse(request.body);
     if (!parsed.success) {
       throw badRequest(`请求体不合法：${parsed.error.issues.map((i) => `${i.path.join(".")} ${i.message}`).join("; ")}`);
     }
     const body = parsed.data;
-    // Anthropic 的 system 是独立字段，与 messages 里的 system 角色合并
+    // Anthropic keeps system in its own field; merge it with the system role inside messages
     const userSystem = flattenContent(body.system);
     const prompt = messagesToPrompt(body.messages);
     const system = [userSystem, prompt.system].filter(Boolean).join("\n\n");
@@ -31,17 +73,19 @@ export function registerMessagesRoutes(app, { ctx }) {
 
     const resolved = await ctx.resolver.resolve(body.model);
     const id = newId("msg_");
+    const startedAt = Date.now();
 
     if (!body.stream) {
       try {
         const result = await runPrompt({ ctx, resolved, prompt, system });
+        logUsage(ctx.logger, { endpoint: "/v1/messages", model: result.model, stream: false, startedAt, result });
         return anthropicMessage({ id, model: result.model, text: result.text, tokens: result.tokens, stopReason: toAnthropicStop(result.finish) });
       } catch (error) {
-        rethrowInternal(ctx.logger, error, "messages 推理");
+        rethrowInternal(ctx.logger, error, "messages inference");
       }
     }
 
-    // —— Anthropic SSE 事件序：message_start → content_block_start → deltas → ……（api.md §6）——
+    // —— Anthropic SSE event order: message_start → content_block_start → deltas → …… (api.md §6) ——
     const sse = startSse(reply);
     const signal = clientAbortSignal(request);
     try {
@@ -74,6 +118,7 @@ export function registerMessagesRoutes(app, { ctx }) {
           delta: { type: "text_delta", text: delta },
         }),
       });
+      logUsage(ctx.logger, { endpoint: "/v1/messages", model: result.model, stream: true, startedAt, result });
       sse.send("content_block_stop", { type: "content_block_stop", index: 0 });
       sse.send("message_delta", {
         type: "message_delta",
@@ -83,10 +128,10 @@ export function registerMessagesRoutes(app, { ctx }) {
       sse.send("message_stop", { type: "message_stop" });
     } catch (error) {
       if (signal.aborted) {
-        ctx.logger.warn({ model: resolved.name }, "客户端断开，推理中止");
+        ctx.logger.warn({ model: resolved.name }, "client disconnected, inference aborted");
       } else {
-        // SSE 已开始，状态码不可改：记录日志后直接终止流（api.md §2.4）
-        ctx.logger.error({ err: error }, "messages 流式推理失败");
+        // SSE has started, the status code cannot change: log and terminate the stream (api.md §2.4)
+        ctx.logger.error({ err: error }, "messages streaming inference failed");
       }
     } finally {
       sse.end();

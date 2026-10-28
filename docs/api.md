@@ -2,7 +2,7 @@
 
 > 配套：[项目设计文档](./design.md)
 > 参照项目：[TiaraBasori/OpenCode2API](https://github.com/TiaraBasori/OpenCode2API)
-> 范围：实现截图中的全部 API（`/v1/models`、`/v1/chat/completions`、`/v1/responses`、`/v1/messages`），并补充**独立的 web-search API** 与**模型命名规则**。
+> 范围：实现截图中的全部 API（`/v1/models`、`/v1/aliases`、`/v1/chat/completions`、`/v1/responses`、`/v1/messages`），并补充**独立的 web-search API** 与**模型命名规则**。
 
 ---
 
@@ -11,11 +11,16 @@
 | 方法 | 路径 | 协议族 | 说明 |
 |:-----|:-----|:-------|:-----|
 | `GET` | `/v1/models` | OpenAI | 模型列表（含虚拟模型 `auto` 与 Ollama 声明） |
+| `GET` | `/v1/aliases` | 自定义 | 模型别名列表（`models.aliases` / `ollama.aliases`） |
 | `POST` | `/v1/chat/completions` | OpenAI | Chat Completions（SSE 流式） |
 | `POST` | `/v1/responses` | OpenAI | Responses API（SSE 流式） |
 | `POST` | `/v1/messages` | Anthropic | Messages API（兼容 Claude SDK，SSE 流式） |
 | `POST` | `/v1/web_search` | 自定义 | **独立 web-search API**（需指定内置模型） |
 | `GET` | `/health` | 自定义 | 健康检查（含 OpenCode 后端连通性） |
+| `GET` | `/docs` | 文档 | Swagger UI（实现辅助，非业务契约） |
+| `GET` | `/docs/json` | 文档 | OpenAPI 3.1 JSON（由路由 schema 生成） |
+
+> `/docs` 与 `/docs/json` 不属于业务 API 契约：开启 `API_KEY` 时仍然公开（浏览器无法为 UI 附加 Authorization），仅暴露接口结构、不含密钥；字段与错误码仍以本文件为准。
 
 > **设计原则**：三个推理端点聚焦**纯文本推理**。`web-search` 是**独立 API**，不内嵌为工具、不追求工具调用的通用性——它直接对外暴露 OpenCode 的内置 web-search 能力，并**必须指定一款内置模型**来驱动。
 
@@ -27,18 +32,21 @@
 
 - **Base URL**：`http://<host>:<PORT>`（默认 `10000`）。
 - **鉴权**（可开关，`API_KEY_ENABLED`）：
-  - OpenAI 系端点：`Authorization: Bearer <API_KEY>`。
-  - Anthropic `/v1/messages`：支持 `x-api-key: <API_KEY>`（或 `Authorization: Bearer`）。
-  - 自定义 `/v1/web_search`：`Authorization: Bearer <API_KEY>`。
-  - 未开启时无需携带；开启后缺失/错误返回 `401`。
+  - OpenAI 系端点：`Authorization: Bearer <key>`。
+  - Anthropic `/v1/messages`：支持 `x-api-key: <key>`（或 `Authorization: Bearer`）。
+  - 自定义 `/v1/web_search`：`Authorization: Bearer <key>`。
+  - 未开启时无需携带；开启后缺失/错误返回 `401`。鉴权发生在**请求体校验之前**，所以未鉴权的请求不会拿到 `400` 的 schema 提示。
+  - 例外：`/docs` 与 `/docs/json` 始终公开（Swagger UI 无法在浏览器中附加 Authorization）。
+- **key 的来源**：默认读取 `config/.keys`（模板 `config/.keys.example`，路径由 `API_KEYS_FILE` 覆盖），**一行一个**，空行与 `#` 开头的行忽略、自动去重；文件里是**明文 key，原样比对**（不加解密、不哈希、不做 `{env:VAR}` 插值）。环境变量 `API_KEY` 追加进同一集合且排在最前。多 key 只是「任意一条匹配即放行」的凭据集合，用于分发给不同调用方与吊销，不含配额、计费或路由语义。开启鉴权但一条 key 都没加载到（文件没找到且 `API_KEY` 为空）时，所有业务请求都会 `401`，启动日志按状态给 `error` / `warn`（只含路径与条数）。
+- **鉴权先于参数校验**：`401` 在请求体校验之前返回，未带凭据的调用方看不到 schema 校验细节。
 - **Content-Type**：`application/json`。
-- 注意：`OPENCODE_SERVER_PASSWORD` 保护的是**后端 `opencode serve`**，与对外 `API_KEY` 是两套独立凭据。
+- 注意：`OPENCODE_SERVER_PASSWORD` 保护的是**后端 `opencode serve`**，与对外的 API KEY（`config/.keys` + `API_KEY`）是两套独立凭据。
 
 ### 2.2 `model` 字段语义（三处统一）
 
 | 取值 | 含义 |
 |:-----|:-----|
-| `"auto"` | 网关按 config/config.yaml `models.auto.regex` 从**内置模型池**随机选一款（见 design.md §4.3） |
+| `"auto"` | 网关按 config/config.yaml `models.allow` 从**内置模型池**随机选一款（见 design.md §4.3） |
 | `<provider>/<model>` | 内置/提供商模型，直接透传给 OpenCode（如 `opencode/flint-40b-free`） |
 | `"ollama/<id>"` | 本地 Ollama 自定义模型，需先在 `config/opencode.json` 声明（如 `ollama/qwen3:4b`） |
 
@@ -66,6 +74,8 @@
 | 502 | `upstream_error` | `opencode_unavailable` | OpenCode 后端不可达 |
 | 503 | `service_unavailable` | `no_available_model` | auto 池为空且无兜底 |
 
+> 模型侧错误统一归一化：OpenCode 返回 `provider.free-limit`（免费模型额度耗尽）或 429 限流时映射为 **429 `quota_exceeded`**；其余模型错误映射为 **502 `opencode_unavailable`**。两种情况下检索类接口（`/v1/web_search` 默认 `synthesize=false`）不受影响，可改用 `ollama-local/*` 继续推理。
+
 ---
 
 ## 3. GET /v1/models
@@ -80,7 +90,7 @@
 {
   "object": "list",
   "data": [
-    { "id": "auto", "object": "model", "created": 1700000000, "owned_by": "gateway", "description": "内置模型正则随机" },
+    { "id": "auto", "object": "model", "created": 1700000000, "owned_by": "gateway", "description": "白名单内内置模型随机" },
     { "id": "opencode/flint-40b-free", "object": "model", "created": 1700000000, "owned_by": "opencode" },
     { "id": "ollama/qwen3:4b", "object": "model", "created": 1700000000, "owned_by": "ollama" }
   ]
@@ -89,6 +99,7 @@
 
 - `auto` 作为**虚拟模型**始终返回，供客户端选用随机内置模型。
 - 其余条目来自 OpenCode 2.x `model.list()`（`ModelInfo[]`，含内置免费模型 `opencode/*-free` 与已配置 provider 的模型），并叠加 `config/opencode.json` 已声明的 Ollama 模型；`enabled=false` 与 `deprecated`/`alpha` 状态的模型不返回。
+- **白名单过滤**：只有模型全名（`<provider>/<model-id>`）命中 config/config.yaml `models.allow` 任一正则的条目才会列出（大小写不敏感）；`models.allow` 为空时不作过滤。白名单只影响展示与 `auto` 选池，不影响显式模型解析。
 - 建议服务端缓存（TTL ~60s），避免每次请求打 OpenCode。
 
 ---
@@ -235,7 +246,7 @@ OpenAI Responses API 协议。
 | 首方（内置免费） | `opencode/<id>`，如 `opencode/flint-40b-free`、`opencode/glm-4.6-free`（免登录、cost=0） |
 | 其他 provider | 沿用其 provider 前缀，如 `anthropic/...`、`openrouter/...` |
 | 合法性 | 必须在 OpenCode 当前可用模型集中存在，否则 `400 model_not_found`；`enabled=false` 与 `deprecated`/`alpha` 模型视为不可用 |
-| `auto` 池来源 | **仅内置模型**参与 config/config.yaml `models.auto.regex` 匹配（不含 Ollama 自定义，避免随机命中本地模型） |
+| `auto` 池来源 | **仅内置模型**参与 config/config.yaml `models.allow` 匹配（不含 Ollama 自定义，避免随机命中本地模型） |
 
 ### 7.3 自定义 Ollama 模型（Custom Ollama）
 
@@ -274,7 +285,7 @@ OpenAI Responses API 协议。
 
 - **独立 API**，不依赖 `tools` 机制，不与 Chat/Responses/Messages 的工具调用耦合。
 - 检索主路径为 **OpenCode 2.x 服务端一等公民 websearch**（`websearch.query()`，服务端自选已配置后端，如 exa/tavily 等）；返回结果 URL 后由网关抓取原页抽取段落。
-- **必须指定一款内置模型**（`model` 字段，见 §7.2）。2.x 下检索本身不消耗模型，该模型仅在 `synthesize=true` 时驱动答案综合；但仍要求为明确内置模型（禁止 `auto` 与 `ollama/`），保持契约稳定并为综合答案预留。
+- **`model` 可省略，且支持别名**。显式指定时按 §7.4 解析（允许内置/提供商模型与短名，禁止 `auto`、`ollama/<id>`）；省略时依次取 config/config.yaml `web_search.model`（若配置）→ 首个 `ollama-local/*` → `models.auto.fallback`。2.x 下检索本身不消耗模型，该模型仅在 `synthesize=true` 时驱动答案综合。
 
 ### 8.2 请求
 
@@ -293,16 +304,18 @@ OpenAI Responses API 协议。
 
 | 字段 | 必填 | 默认 | 说明 |
 |:-----|:-----|:-----|:-----|
-| `model` | 是* | config/config.yaml `web_search.model` | **内置模型**（`<provider>/<id>`）；配置了默认值时可省略。仅 `synthesize=true` 时驱动模型 |
-| `query` | 是 | — | 搜索关键词 |
+| `model` | 否 | `web_search.model` → 首个 `ollama-local/*` → `models.auto.fallback` | 模型全名或别名（`models.aliases` / `ollama.aliases`，大小写不敏感）；仅 `synthesize=true` 时驱动模型 |
+| `query` | **是** | — | 搜索关键词（不可为空） |
 | `top_k` | 否 | config/config.yaml `search.top_k`(5) | 结果条数（受服务端上限约束） |
 | `max_chars_per_page` | 否 | config/config.yaml `search.max_chars_per_page`(4000) | 单页段落截断上限 |
 | `locale` | 否 | `zh-CN` | 区域偏好（兜底 SearchProvider 用；服务端 websearch 不透传） |
-| `recency` | 否 | — | 时间范围：`day`/`week`/`month`/`year`（当前两种路径均不透传，保留字段） |
-| `synthesize` | 否 | `false` | 是否用该内置模型把段落综合成 `answer` |
+| `recency` | 否 | 不限制 | 时间范围：`day`/`week`/`month`/`year`（预留字段，当前两条路径均不透传） |
+| `synthesize` | 否 | config/config.yaml `web_search.synthesize_default`(false) | 是否用该模型把段落综合成 `answer` |
 | `include_sources` | 否 | `true` | 是否返回 `results[]` 明细 |
 
-> *`model` 为内置模型；config/config.yaml `web_search.model` 有值时 `model` 可省略。传入 `auto` 或 `ollama/...` 返回 `400 invalid_model`。
+> **仅 `query` 必填**，其余字段均可省略并取上表默认值。
+> `model` 省略时的候选按顺序尝试，失效（模型下线）会跳到下一个；`web_search.model` 留空时直接使用首个 `ollama-local/*`。
+> 显式传入 `auto` 或 `ollama/<id>` 返回 `400 invalid_model`；显式传入未知模型/别名返回 `400 model_not_found`。
 > `top_k` / `max_chars_per_page` 未传时取 config/config.yaml 默认值，请求参数可覆盖。
 
 ### 8.3 响应（200）
@@ -338,9 +351,11 @@ OpenAI Responses API 协议。
 | HTTP | code | 场景 |
 |:-----|:-----|:-----|
 | 400 | `invalid_request` | `query` 缺失/为空 |
-| 400 | `invalid_model` | `model` 为 `auto`/`ollama/...`，或不在内置模型集 |
+| 400 | `invalid_model` | 显式 `model` 为 `auto` / `ollama/<id>` |
+| 400 | `model_not_found` | 显式 `model` 或别名不存在 |
 | 401 | `invalid_api_key` | 鉴权失败（若开启） |
 | 502 | `upstream_error` | 搜索后端/抓取失败（整体失败；单页失败仅空段落） |
+| 503 | `no_available_model` | 未传 `model` 且 `ollama-local/*`、`web_search.model`、`models.auto.fallback` 均不可用 |
 
 ---
 
@@ -372,6 +387,12 @@ sequenceDiagram
 
 - **主路径**：OpenCode 2.x 服务端 websearch（`websearch.query()`）返回 URL 与摘要，网关抓取原页抽取段落，返回 `text`（及可选 `answer`）。
 - **兜底**：服务端 websearch 失败（未配置后端 / 503 等）时，网关回退到自实现的 `SearchProvider`（见 §9.1），保证 API 可用；`engine` 字段反映实际路径。
+- **服务端 websearch 需要「声明」，不一定需要密钥**：`websearch.query()` 在 2.x 会先要一个 provider 声明，未声明直接返回 `Web search provider is required`。声明有两个来源：
+  - **OpenCode 自身状态**：交互式跑过一次 opencode，设置会落进它的数据库（本机 `~/.local/share/opencode/opencode.db` 的 `kv` 表里就有 `websearch:provider = "random"`），所以宿主机不写任何配置也能用。
+  - **配置声明**：`opencode.json` 里的 `websearch.provider`，或环境变量 `OPENCODE_CONFIG_CONTENT`（镜像已预设为 `{"websearch":{"provider":"random"}}`）。
+  容器是全新的 OpenCode home，没有那条状态记录，因此必须由配置声明补上——这是容器与本机表现不同的唯一原因，与精简变量、挂载方式无关（实测把 `OPENCODE_DISABLE_*` 全部取消仍然报错，加上声明立刻可用）。
+- **`random` 免密钥可用**：实测容器内仅声明 `{"websearch":{"provider":"random"}}`、不配任何凭据，`/v1/web_search` 即返回 `engine=opencode-websearch`（服务端自选到 tinyfish，9 条结果）。要固定某个后端才需要写 `provider: "tavily"` 之类并提供其 `*_API_KEY`（此时错误会从 `provider is required` 变成 `Web search request failed: <provider>`，即只差密钥）。
+- 未声明也未兜底前，容器会先记一条 `Server-side websearch failed, falling back…` 的 warn 再走兜底后端，这是预期行为，不是故障。
 - 不引入工具调用协议：客户端只按 §8 的请求/响应格式使用。
 
 ### 9.1 自实现 SearchProvider（兜底）
@@ -384,7 +405,48 @@ interface SearchProvider {
 }
 ```
 
-- 可插拔后端（config/config.yaml `search.provider`，默认免费后端）：`duckduckgo`（默认，国内不稳）、`bing`、`brave`、`custom`（国内网关）。
+- 可插拔后端（config/config.yaml `search.provider`）。**免费且无需 key**：`duckduckgo`（默认；国内网络不稳）、`bing`（HTML 抓取，可能触发反爬验证）；**需 key**：`brave`（须设置 `SEARCH_API_KEY`，官方有免费额度但不是 keyless）；**自建**：`custom`（`search.base_url`，成本取决于自建服务）。
+- 说明：主路径「服务端 websearch」使用 **OpenCode 侧已声明的检索后端**（镜像默认声明 `random`，由服务端自选一个免凭据可达的后端；也可固定为 exa/tavily 等并提供其 key）；网关兜底 `search.provider` 默认 `duckduckgo`，无需任何 key。
 - 抓取与抽取：对结果 URL 发 HTTP GET（超时 + UA），轻量正文抽取得到段落；单页失败返回空段落。
 - 体积控制：默认取 config/config.yaml `search.max_chars_per_page`（4000），可被请求 `max_chars_per_page` 覆盖。
+
+---
+
+## 10. GET /v1/aliases
+
+返回 config/config.yaml 中声明的模型短名映射（`models.aliases` 与 `ollama.aliases`），便于客户端发现可用的别名。仅反映**配置声明**，不校验目标模型当前是否在 OpenCode 可用；别名的解析规则见 §7.4。
+
+### 请求
+无 body、无查询参数；鉴权与其它端点一致（若开启）。
+
+### 响应（200）
+```json
+{
+  "object": "list",
+  "data": [
+    { "alias": "flint", "model": "opencode/flint-40b-free", "source": "models.aliases" },
+    { "alias": "qwen3.5", "model": "ollama-local/qwen3.5:9b", "source": "ollama.aliases" }
+  ]
+}
+```
+
+| 字段 | 类型 | 说明 |
+|:-----|:-----|:-----|
+| `alias` | string | 短名，统一小写（解析时大小写不敏感） |
+| `model` | string | 别名指向的模型全名（`<provider>/<model-id>`） |
+| `source` | string | `models.aliases`（内置模型别名）或 `ollama.aliases`（Ollama 别名） |
+
+- 按 `alias` 升序排列（同名时按 `source`）。
+- 未配置任何别名时返回 `{ "object": "list", "data": [] }`。
+- 返回内容不受 `models.allow` 影响：白名单只约束 `/v1/models` 展示与 `auto` 选池，别名解析仍然可用。
+
+### 示例
+```bash
+curl http://127.0.0.1:10000/v1/aliases
+```
+
+### 错误码
+| HTTP | code | 场景 |
+|:-----|:-----|:-----|
+| 401 | `invalid_api_key` | 鉴权失败（若开启） |
 

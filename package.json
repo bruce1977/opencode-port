@@ -19,7 +19,9 @@
     "check": "npm run lint && npm test"
   },
   "dependencies": {
-    "@opencode/client": "2.1.4",
+    "@fastify/swagger": "^9.9.2",
+    "@fastify/swagger-ui": "^6.1.2",
+    "@opencode/client": "2.2.0",
     "fastify": "^5.12.7",
     "yaml": "^2.9.1",
     "zod": "^4.6.7"

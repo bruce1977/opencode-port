@@ -1,23 +1,25 @@
-// 模型解析层：auto 正则随机 / Ollama 映射 / 别名 / 显式透传（api.md §7）。
-// 依赖后端 client.listModels()（2.x 模型为一等公民：ModelInfo[]），带 TTL 缓存（design.md §4.3）。
+// Model resolution layer: random pick from the auto allowlist / Ollama mapping / aliases / explicit passthrough (api.md §7).
+// Depends on backend client.listModels() (2.x models are first-class: ModelInfo[]), with a TTL cache (design.md §4.3).
 import { invalidModel, modelNotFound, noAvailableModel } from "./errors.mjs";
 
 const POOL_TTL_MS = 60000;
-// api.md §7.5：auto 单独匹配；<namespace>/<model-id> 允许 : / _ . -；裸名走别名表（resolve 内再判）
+// api.md §7.5: auto matches on its own; <namespace>/<model-id> allows : / _ . -; bare names go through the alias table (checked inside resolve)
 const MODEL_PATTERN = /^(auto|[a-z0-9._-]+(\/[a-z0-9._:/-]+)?)$/i;
 const OLLAMA_NAMESPACE = "ollama";
+const OLLAMA_LOCAL_PREFIX = "ollama-local/";
+const AUTO_ENTRY = Object.freeze({ id: "auto", owned_by: "gateway", description: "白名单内内置模型随机" });
 
 /**
  * @param {object} options
  * @param {ReturnType<import("./opencode-client.mjs").createBackendClient>} options.client
  * @param {ReturnType<import("../config.mjs").loadConfig>} options.config
  * @param {{ debug: Function, warn: Function }} options.logger
- * @param {() => number} [options.random] 注入用（测试传定值）
+ * @param {() => number} [options.random] for injection (tests pass a fixed value)
  */
 export function createModelResolver({ client, config, logger, random = Math.random }) {
   let cache = { at: 0, builtins: [], ollama: [] };
 
-  /** 拉取模型列表并归一化为 { builtins, ollama } 两组（禁用/废弃/内测模型不入池） */
+  /** Fetch the model list and normalize it into { builtins, ollama } (disabled/deprecated/alpha models are excluded) */
   async function refreshPool(force = false) {
     if (!force && Date.now() - cache.at < POOL_TTL_MS) return cache;
     const models = await client.listModels();
@@ -37,28 +39,35 @@ export function createModelResolver({ client, config, logger, random = Math.rand
       }
     }
     cache = { at: Date.now(), builtins, ollama };
-    logger.debug({ builtins: builtins.length, ollama: ollama.length }, "模型池已刷新");
+    logger.debug({ builtins: builtins.length, ollama: ollama.length }, "model pool refreshed");
     return cache;
   }
 
-  /** auto 池：正则匹配 → 排除名单 → 随机；空池走 fallback（api.md §7.2） */
+  /** models.allow: an empty list means no filtering; otherwise the full model name must match one of the regexes (compiled with i) */
+  function matchesAllow(fullName) {
+    return config.allow.regex.length === 0 || config.allow.regex.some((re) => re.test(fullName));
+  }
+
+  /** auto pool: models.allow match → exclusion list → random; empty pool falls back (api.md §7.2) */
   async function pickAuto() {
     const pool = await refreshPool();
+    // ollama-local is a custom provider (only registered in the builtins group); it never joins auto even if it matches allow (api.md §7.2)
     const matched = pool.builtins.filter((model) => {
       const name = model.name.toLowerCase();
+      if (name.startsWith(OLLAMA_LOCAL_PREFIX)) return false;
       if (config.auto.exclude.includes(name)) return false;
-      return config.auto.regex.some((re) => re.test(name));
+      return matchesAllow(name);
     });
     if (matched.length > 0) {
       const picked = matched[Math.floor(random() * matched.length)];
-      logger.debug({ model: picked.name, pool: matched.length }, "auto 命中模型");
+      logger.debug({ model: picked.name, pool: matched.length }, "auto picked model");
       return picked;
     }
     if (config.auto.fallback) {
-      logger.warn({ fallback: config.auto.fallback }, "auto 池为空，使用 fallback");
+      logger.warn({ fallback: config.auto.fallback }, "auto pool is empty, using fallback");
       return resolve(config.auto.fallback);
     }
-    throw noAvailableModel("auto 池为空且未配置 fallback（检查 models.auto.regex / exclude）");
+    throw noAvailableModel("auto 池为空且未配置 fallback（检查 models.allow / auto.exclude）");
   }
 
   function requireBuiltin(name) {
@@ -76,7 +85,7 @@ export function createModelResolver({ client, config, logger, random = Math.rand
   }
 
   /**
-   * 解析请求中的 model 字段（api.md §7.4 优先级）。
+   * Resolve the model field of a request (api.md §7.4 priority).
    * @returns {Promise<{ providerID: string, modelID: string, name: string }>}
    */
   async function resolve(requested) {
@@ -89,11 +98,11 @@ export function createModelResolver({ client, config, logger, random = Math.rand
 
     if (lower === "auto") return pickAuto();
 
-    // 2. ollama 短名映射
+    // 2. ollama short-name mapping
     const ollamaAlias = config.ollamaAliases[lower];
     if (ollamaAlias) return resolve(ollamaAlias);
 
-    // 3. 内置短名映射
+    // 3. builtin short-name mapping
     const builtinAlias = config.modelAliases[lower];
     if (builtinAlias) return resolve(builtinAlias);
 
@@ -102,14 +111,14 @@ export function createModelResolver({ client, config, logger, random = Math.rand
       return requireOllama(name.slice(OLLAMA_NAMESPACE.length + 1));
     }
 
-    // 5/6. 显式 <provider>/<id>（含裸名走别名表未命中 → 400）
+    // 5/6. explicit <provider>/<id> (a bare name that missed the alias table → 400)
     if (!name.includes("/")) {
       throw modelNotFound(`未知模型：${name}（裸名只能命中 models.aliases）`);
     }
     return requireBuiltin(name);
   }
 
-  /** web-search 用：只接受明确的内置模型（拒绝 auto / ollama） */
+  /** For web-search: only explicit builtin models are accepted (auto / ollama are rejected) */
   async function resolveBuiltinOnly(requested) {
     const resolved = await resolve(requested);
     if (resolved.providerID === OLLAMA_NAMESPACE || requested.toLowerCase() === "auto") {
@@ -118,15 +127,51 @@ export function createModelResolver({ client, config, logger, random = Math.rand
     return resolved;
   }
 
-  /** /v1/models：auto + 内置 + ollama 声明（api.md §3） */
+  /**
+   * Model resolution for web-search (api.md §8.2): an explicit model (aliases supported) wins;
+   * when omitted, try web_search.model → first ollama-local/* → models.auto.fallback in order.
+   * Default candidates come from config/live model pool; on failure try the next one so a stale default cannot break the endpoint.
+   */
+  async function resolveWebSearchModel(requested) {
+    if (requested) return resolveBuiltinOnly(requested);
+
+    const pool = await refreshPool();
+    const firstLocal = pool.builtins.find((model) => model.name.toLowerCase().startsWith(OLLAMA_LOCAL_PREFIX));
+    const candidates = [config.webSearch.model, firstLocal?.name, config.auto.fallback].filter(Boolean);
+
+    const tried = new Set();
+    for (const candidate of candidates) {
+      if (tried.has(candidate.toLowerCase())) continue;
+      tried.add(candidate.toLowerCase());
+      try {
+        return await resolveBuiltinOnly(candidate);
+      } catch (error) {
+        if (error.status !== 400) throw error;
+        logger.warn({ model: candidate }, "web-search default model unavailable, trying next candidate");
+      }
+    }
+    throw noAvailableModel("web-search 未指定 model，且无可用默认模型（检查 ollama-local/*、web_search.model 或 models.auto.fallback）");
+  }
+
+  /** /v1/models: auto + builtins + declared ollama (api.md §3) */
   async function listAll() {
     const pool = await refreshPool(true);
     return {
-      auto: { id: "auto", owned_by: "gateway", description: "内置模型正则随机" },
+      auto: AUTO_ENTRY,
       builtins: pool.builtins,
       ollama: pool.ollama,
     };
   }
 
-  return { resolve, resolveBuiltinOnly, listAll, refreshPool };
+  /** Public /v1/models listing: only models matching models.allow; the virtual auto entry is always returned */
+  async function listAllowed() {
+    const pool = await refreshPool(true);
+    return {
+      auto: AUTO_ENTRY,
+      builtins: pool.builtins.filter((model) => matchesAllow(model.name)),
+      ollama: pool.ollama.filter((model) => matchesAllow(model.name)),
+    };
+  }
+
+  return { resolve, resolveBuiltinOnly, resolveWebSearchModel, listAll, listAllowed, refreshPool };
 }

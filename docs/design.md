@@ -23,17 +23,17 @@ OpenCode 内置了若干**免费模型**（`opencode/*-free` 系列，免登录�
 1. **标准 API 使用免费模型推理**：兼容 OpenAI 的 Chat Completions / Responses API，可直接用内置免费模型推理。
 2. **`auto` 模型模式**：通过配置指定模型名称**正则表达式**，在匹配到的模型列表里**随机**选一款进行推理，规避「免费模型名称不固定、部分模型国内不可用」的问题。
 3. **Ollama 自定义模型接入**：可在配置中声明 Ollama 服务里的自定义模型，并经由本网关对外暴露。
-4. **独立 web-search API**：输入关键词 → 返回匹配网页段落文字；需指定内置模型驱动，不内嵌为工具。
+4. **独立 web-search API**：输入关键词 → 返回匹配网页段落文字；`model` 可省略（自动默认链）或使用别名，不内嵌为工具。
 5. **可选 API KEY 鉴权**：通过请求头 `Authorization: Bearer <key>` 做安全认证，可开关。
 
 ### 1.3 与原项目的功能差异（对照）
 
 | 维度 | OpenCode2API（原） | 本项目（衍生） |
 |:-----|:-------------------|:---------------|
-| 模型选择 | 模型别名解析（如 `gpt5-nano → gpt-5-nano`）、allowlist | **新增 `auto` 正则随机模式** + 国内可用性过滤 |
-| 外部工具 | `web_fetch`（按 URL 抓取）、工具桥接 | **独立 `web_search` API**（关键词 → 段落文字，需指定内置模型） |
+| 模型选择 | 模型别名解析（如 `gpt5-nano → gpt-5-nano`）、allowlist | **新增 `auto` 白名单随机模式** + 国内可用性过滤 |
+| 外部工具 | `web_fetch`（按 URL 抓取）、工具桥接 | **独立 `web_search` API**（关键词 → 段落文字，`model` 可省略/别名） |
 | Ollama | 依赖 OpenCode 自身 provider 配置 | **显式配置项**声明 Ollama 自定义模型并对外暴露 |
-| 鉴权 | `API_KEY` / 多用户 key | 同样支持，定位为**可选开关** |
+| 鉴权 | `API_KEY` / 多用户 key | 同样支持，定位为**可选开关**；多 key 从 `config/.keys` 读取（一行一个），只做凭据分发与吊销，无配额/计费语义 |
 | 端点 | chat/responses/messages + 面板/指标 | 聚焦 chat/responses，面板/指标作为可选扩展 |
 
 ---
@@ -43,11 +43,11 @@ OpenCode 内置了若干**免费模型**（`opencode/*-free` 系列，免登录�
 | 术语 | 含义 |
 |:-----|:-----|
 | `opencode serve` | OpenCode 的无头 HTTP 服务，暴露 OpenAPI 端点（路由前缀 `/api/*`，默认端口 `4096`，host `127.0.0.1`） |
-| OpenCode 客户端 | `@opencode/client`（2.x；scope 为 `@opencode`，不带 `-ai`），由服务端 OpenAPI 规范生成，**版本必须与 CLI `@opencode/cli` 同版本**（当前 `2.1.4`） |
+| OpenCode 客户端 | `@opencode/client`（2.x；scope 为 `@opencode`，不带 `-ai`），由服务端 OpenAPI 规范生成，**版本必须与 CLI `@opencode/cli` 同版本**（当前 `2.2.0`） |
 | OpenCode 内置免费模型 | `opencode/*-free` 系列（如 `opencode/flint-40b-free`），免登录、cost=0，经 `model.list()` 返回 |
 | Ollama provider | 通过 `@ai-sdk/openai-compatible` 适配器接入本地 Ollama，模型全称为 `ollama/<id>` |
 | `auto` 模式 | 请求 `model: "auto"` 时，由网关按配置正则从可用模型池中**随机**选一款 |
-| web-search 独立 API | 对外暴露检索能力：关键词 → 段落文字；检索主路径为服务端 websearch，需指定内置模型（`synthesize` 时驱动综合） |
+| web-search 独立 API | 对外暴露检索能力：关键词 → 段落文字；检索主路径为服务端 websearch，`model` 可省略或使用别名（`synthesize` 时驱动综合） |
 
 ---
 
@@ -150,7 +150,7 @@ sequenceDiagram
     G->>R: resolve(model)
     alt model == "auto"
         R->>S: GET /api/model 拉取可用模型（TTL 缓存）
-        R->>R: 按正则过滤 + 剔除排除名单 → 随机选 1
+        R->>R: 按 models.allow 过滤 + 剔除排除名单 → 随机选 1
     else Ollama / 显式 / 别名
         R->>R: 直接映射为 {providerID, id}
     end
@@ -167,12 +167,12 @@ sequenceDiagram
 ### 4.3 `auto` 模型选择算法
 
 1. 网关启动时（并周期性刷新，TTL 60s）调用 `model.list()`（`GET /api/model`），得到当前 OpenCode 可用的**内置模型**全集（`opencode/*-free` 免费模型及已连接 provider，过滤 `enabled=false` 与 `deprecated`/`alpha`；**不含 Ollama 自定义**，见 api.md §7.2）。
-2. 对 config/config.yaml `models.auto.regex` 的每条（可多条，支持分组），用 `RegExp` 匹配模型名。
-3. 从匹配结果中**剔除** config/config.yaml `models.auto.exclude`（国内不可用 / 已知不稳定）名单。
+2. 对 config/config.yaml `models.allow` 的每条正则（可多条，大小写不敏感）匹配模型名；`models.allow` **同时是 `/v1/models` 的展示白名单**（空列表表示不过滤）。
+3. 从命中结果中**剔除** config/config.yaml `models.auto.exclude`（国内不可用 / 已知不稳定）名单。
 4. 若结果非空，`Math.random()` 随机取一款；若为空，回退到 `models.auto.fallback` 显式模型或返回 503。
 5. 每次请求独立随机，避免热点模型被集中打满。
 
-> 设计动机：免费模型名称随 OpenCode 版本/区域变动，且部分模型在国内网络不可用；正则 + 排除名单 + 随机，可在「无需人工频繁改配置」的前提下保持服务可用。
+> 设计动机：免费模型名称随 OpenCode 版本/区域变动，且部分模型在国内网络不可用；白名单 + 排除名单 + 随机，可在「无需人工频繁改配置」的前提下保持服务可用，同时让对外模型清单稳定可控。
 
 ### 4.4 Ollama 自定义模型接入
 
@@ -198,8 +198,8 @@ flowchart LR
     H --> E
 ```
 
-- **服务端 websearch 优先**：优先调用 OpenCode 2.x 服务端一等公民 `websearch.query()`（服务端自选已配置后端）；失败（未配置后端 / 503 等）时回退到自实现可插拔 `SearchProvider`（`duckduckgo`/`bing`/`brave`/`custom`），响应 `engine` 字段反映实际路径。
-- **必须指定内置模型**：`model` 为 `<provider>/<id>` 的内置模型（拒绝 `auto` / `ollama/...`）；可用 config/config.yaml `web_search.model` 作为默认。2.x 下检索本身不消耗模型，该模型仅在 `synthesize=true` 时驱动答案综合。
+- **服务端 websearch 优先**：优先调用 OpenCode 2.x 服务端一等公民 `websearch.query()`（服务端自选已配置后端）；失败（未配置后端 / 503 等）时回退到自实现可插拔 `SearchProvider`（`duckduckgo`/`bing`/`brave`/`custom`），响应 `engine` 字段反映实际路径。其中 `duckduckgo` / `bing` 免费且无需 key，`brave` 需 `SEARCH_API_KEY`，`custom` 为自建网关。
+- **模型可省略且支持别名**：显式 `model` 按 api.md §7.4 解析（拒绝 `auto` / `ollama/<id>`）；省略时依次取 config/config.yaml `web_search.model`（若配置）→ 首个 `ollama-local/*` → `models.auto.fallback`，候选失效则跳到下一个，全部失效返回 503。2.x 下检索本身不消耗模型，该模型仅在 `synthesize=true` 时驱动答案综合。
 - **抓取与抽取**：对结果 URL 发 HTTP GET，用轻量正文抽取得到段落；按 `top_k` 与请求 `max_chars_per_page`（默认取 config/config.yaml）截断，避免 token 爆炸。
 - **错误处理**：单页失败不影响其余；超时/反爬返回空段落（或以摘要兜底）；整体失败才 502。
 - 详细请求/响应见 [api.md §8](./api.md)。
@@ -207,7 +207,11 @@ flowchart LR
 ### 4.6 鉴权
 
 - 开关 `API_KEY_ENABLED`；开启时，所有 `/v1/*` 与 `/panel`（如启用）需携带 `Authorization: Bearer <key>`，否则 `401`。
-- key 存于环境变量 `API_KEY`（单 key）。默认仅使用免费资源，多用户/付费 key 暂不纳入。
+- 鉴权挂在 **`onRequest`**，不是 `preHandler`：Fastify 在 preHandler 之前就做请求体校验，用 preHandler 的话未鉴权请求会先拿到 `400`，把 schema 细节白送给调用方（`tests/app.test.mjs` 有用例锁住这一点）。
+- key 清单默认从 **`config/.keys` 读取，一行一个**（空行与 `#` 注释忽略、去重），路径由 `API_KEYS_FILE` 覆盖；环境变量 `API_KEY` 追加进同一集合并排在最前（`config.apiKeys`）。
+- **文件内容是明文 key，读到就用**：不加解密、不哈希、不做 `{env:VAR}` 插值，也没有 key 与用户/权限的映射表；校验就是「任意一条与请求携带的值全等即放行」（用 `timingSafeEqual` 比较，长度不同直接判否）。
+- 多 key 只用于分发凭据与吊销单条，**不含配额、计费与路由语义**；默认仍只用免费资源，多用户付费 key 不纳入。
+- key 值只进内存与比较运算：不写日志、不进错误响应、不进镜像层（`config/.keys` 同时 gitignore 与 dockerignore，运行期由 `./config` 只读挂载提供）。启动时按状态打一条日志（只含路径与条数）：有 key → `info`；**文件没找到且 `API_KEY` 也为空 → `error`**（鉴权开着却没人能进来，最容易被误判成网关故障）；文件没找到但 `API_KEY` 有值 → `warn`；鉴权关闭且无文件 → `debug`。
 - `OPENCODE_SERVER_PASSWORD`（OpenCode 后端）与**本网关 API KEY 是两套独立凭据**：前者保护 OpenCode server，后者保护对外 API。
 
 ---
@@ -234,13 +238,14 @@ flowchart LR
 - 维护 Ollama 模型映射表。
 
 ### 5.4 API 网关层 `api/*`
-- `routes/health.mjs`、`routes/models.mjs`、`routes/chat.mjs`、`routes/responses.mjs`、`routes/messages.mjs`、`routes/web-search.mjs`
+- `routes/health.mjs`、`routes/models.mjs`、`routes/aliases.mjs`、`routes/chat.mjs`、`routes/responses.mjs`、`routes/messages.mjs`、`routes/web-search.mjs`
+- `openapi.mjs`：注册 `@fastify/swagger` / `@fastify/swagger-ui`，`/docs` 提供 OpenAPI 3.1 交互文档、`/docs/json` 输出规范；请求体 schema 由路由内 zod schema 经 `toJsonSchema()` 生成，避免「文档 / 校验」两套定义漂移。
 - 协议转换：OpenAI 请求体 → OpenCode `parts`；OpenCode 消息流 → OpenAI SSE（`chat.completion.chunk` / Responses 事件）。
 - 会话映射：客户端 `session`/`conversation` 概念 ↔ OpenCode `session.id`，带 TTL 清理。
 
 ### 5.5 web-search 模块 `tools/web-search.mjs`
 - `runWebSearch({ model, query, topK, ... })` → `{ text, results?, answer?, engine }`
-- 优先**服务端 websearch**（`websearch.query()`，服务端自选已配置后端）；失败兜底走 `SearchProvider` 抽象，便于替换后端。
+- 优先**服务端 websearch**（`websearch.query()`，服务端自选已声明的后端；全新 OpenCode home 需先声明 provider，见 §6.5）；失败兜底走 `SearchProvider` 抽象，便于替换后端。
 
 ### 5.6 模型命名与解析 `core/model-resolver.mjs`
 - 实现 api.md §7 的命名规则与解析优先级（`auto` / 内置 / `ollama/` / 别名）。
@@ -248,6 +253,7 @@ flowchart LR
 
 ### 5.7 配置层 `config.mjs`
 - 使用 `zod` 校验环境变量 + `config/config.yaml`，集中暴露 `AppConfig`。
+- `readApiKeys(path)` 读对外 key 清单（`API_KEYS_FILE`，默认 `config/.keys`）：一行一个、忽略空行与 `#` 注释、按出现顺序去重；文件缺失返回空数组（不报错），读不了则抛错让启动失败。`loadConfig` 把它与 `API_KEY` 合并成 `apiKeys`，`apiKey` 取第一个供自测携带。
 - `loadDotEnv()` 供进程入口在配置校验前加载项目根 `.env`（真实环境变量优先），不引入 dotenv 依赖。
 
 ### 5.8 启动清单与运行期自测
@@ -258,12 +264,19 @@ flowchart LR
 
 ## 6. 配置体系
 
-配置按**职责分层**：版本在 Dockerfile 固定，敏感/部署相关走环境变量，业务默认走 `config/config.yaml`，Ollama provider 走 OpenCode 自身配置。
+配置按**职责分层**：版本在 Dockerfile 固定，敏感/部署相关走环境变量，业务默认走 `config/config.yaml`，provider 与服务端检索后端声明走 OpenCode 自身配置。
 
 ### 6.1 Dockerfile（版本绑定，非环境变量）
 
-- `@opencode/cli` 与 `@opencode/client` 版本在**构建期**固定（`ARG OPENCODE_CLI_VERSION` / `package.json` + lockfile），随镜像固化；两者**必须同版本**（当前 `2.1.4`）。**不再提供** `OPENCODE_CLI_VERSION` / `SDK_VERSION` 环境变量。
-- `config/config.yaml`（直接入库）、`config/opencode.json`（模板 `config/opencode.json.example`）一并打包进镜像。
+- `@opencode/cli` 与 `@opencode/client` 版本在**构建期**固定（`ARG OPENCODE_CLI_VERSION` / `package.json` + lockfile），随镜像固化；两者**必须同版本**（当前 `2.2.0`）。**不再提供** `OPENCODE_CLI_VERSION` / `SDK_VERSION` 环境变量。
+- `config/config.yaml`（直接入库）随镜像打包；`config/opencode.json` 含本机地址/密钥，**不进镜像**（`.dockerignore` 排除）。两者同处 `./config`，运行时整目录只读挂载到 `/app/config`，`OPENCODE_CONFIG_DIR` 指向该目录，只需一个卷。
+- 镜像预设一组 OpenCode 精简变量：`OPENCODE_CONFIG_DIR=/app/config`、`OPENCODE_DISABLE_PROJECT_CONFIG`、`OPENCODE_DISABLE_CLAUDE_CODE`、`OPENCODE_DISABLE_CLAUDE_CODE_SKILLS`、`OPENCODE_DISABLE_AUTOUPDATE`、`OPENCODE_DISABLE_FILEWATCHER`（均为 `true`），减少每次请求固定注入的指令/技能/插件上下文。变量名逐个对 2.2.0 二进制核过；1.x 的 `OPENCODE_DISABLE_DEFAULT_PLUGINS` / `OPENCODE_DISABLE_LSP_DOWNLOAD` 在 2.x 已不被识别，故不再设置（留着只会给人「已经在裁剪」的错觉）。`OPENCODE_DISABLE_MODELS_FETCH` 同样存在，但它会影响内置模型目录，未验证不预设。
+- 部署相关的**非敏感项**在镜像里就有默认值（`PORT=10000`、`OPENCODE_SERVER_PORT=10001`、`LOG_LEVEL=info`、`CONFIG_PATH=/app/config/config.yaml`），与 `src/config.mjs` 的默认值一致；裸 `docker run` 也能起得来。`API_KEY_ENABLED` 只在 `src/config.mjs` 里默认 `false`，镜像**不写**这个 `ENV`：BuildKit 会把名字含 `API_KEY` 的变量当密钥报 `SecretsUsedInArgOrEnv`。
+- 镜像还预设 `OPENCODE_CONFIG_CONTENT={"websearch":{"provider":"random"}}`：给容器补上「跑过一次交互式 opencode」才会写进状态库的 websearch provider 声明（免凭据，见 §6.5）。运行期用 `-e`/compose 覆盖即可，注意它是整体替换而非合并。
+- 密钥项（`OPENCODE_SERVER_PASSWORD` / `API_KEY` / `SEARCH_API_KEY`，以及 provider 的 `OLLAMA_API_KEY` / `TAVILY_API_KEY`）在镜像里**完全不存在**：既不写成 `ARG`，也不留 `ENV` 声明（密钥名出现在 `ENV` 里就会触发 BuildKit 的 `SecretsUsedInArgOrEnv` 告警，`API_KEY_ENABLED` / `API_KEYS_FILE` 这类**名字**含 `API_KEY` 的非敏感变量同样会被误报，所以也只在 `src/config.mjs` 与 compose 里给值），真值一律由运行期注入（compose / `--env-file` / `-e`），因此不会进入镜像层与 `docker history`。
+- 对外 key 清单 `config/.keys` 同理：`.gitignore` + `.dockerignore` 双重排除，镜像里只有模板 `config/.keys.example`；容器靠 `./config:/app/config:ro` 这一处只读挂载拿到真值，代码默认 `./config/.keys` 在工作目录 `/app` 下就是 `/app/config/.keys`，无需任何额外配置。
+- **`API_KEYS_FILE` 不进镜像也不由 compose 转发**：`.env` 与本机环境变量描述的是**宿主机**路径（Windows 下形如 `D:\...\config\.keys`），原样注入容器会指向一个不存在的文件，`readApiKeys` 只能返回空清单，于是开启鉴权后所有请求 `401`（启动日志的 `keysFile` + `keyCount` 就是用来定位这件事的）。要改容器内路径只能在 `docker-compose.yml` 的 `environment` 里写字面容器路径。
+- **不配置 Docker `HEALTHCHECK`**：网关进程内已有 60s 周期自测（请求自身 `/health` 并记录延迟/版本/失败次数），容器层再探测属于重复。
 
 ### 6.2 环境变量（部署相关 / 敏感）
 
@@ -274,27 +287,32 @@ flowchart LR
 | `OPENCODE_SERVER_URL` | 空 | 外部实例地址；设置后不拉起子进程，直接连接 |
 | `OPENCODE_SERVER_PASSWORD` | 空 | OpenCode server HTTP Basic 密码 |
 | `API_KEY_ENABLED` | `false` | 是否开启对外 API KEY 鉴权 |
-| `API_KEY` | 空 | 单 key |
+| `API_KEY` | 空 | 单个 key，追加进 `config/.keys` 的集合并排在最前 |
+| `API_KEYS_FILE` | `./config/.keys` | **对外 key 清单文件，一行一个**（空行/`#` 注释忽略、去重）。文件缺失只意味着「没有 key」，不报错；读不了（权限等）则启动失败 |
 | `SEARCH_API_KEY` | 空 | 仅使用付费搜索后端时需要；默认免费后端无需 |
+| `OLLAMA_API_KEY` | 空 | 网关不读，仅透传给 `opencode serve`：`config/opencode.json` 里 `{env:OLLAMA_API_KEY}` 插值用 |
+| `TAVILY_API_KEY` | 空 | 网关不读，仅透传给 `opencode serve`：固定某个检索后端时才需要（默认 `random` 免密钥） |
+| `OPENCODE_CONFIG_CONTENT` | 镜像预设 `{"websearch":{"provider":"random"}}` | 网关不读，透传给 `opencode serve` 的内联配置（整体替换镜像预设，见 §6.1） |
 | `CONFIG_PATH` | `./config/config.yaml` | 配置文件路径 |
 | `LOG_LEVEL` | `info` | 网关日志级别（fatal/error/warn/info/debug/trace/silent） |
 
-> 默认**尽量使用免费资源**：不配置付费模型 key、不使用付费搜索后端；`OPENCODE_API_KEYS`（多用户付费 key）不再作为配置项。
+> 默认**尽量使用免费资源**：不配置付费模型 key、不使用付费搜索后端；`OPENCODE_API_KEYS`（多用户付费 key）仍不作为配置项。
+> 对外 API KEY 的**多 key** 不属于「付费 key」：它是一份等值凭据清单（`config/.keys`，一行一个），只用于分发与吊销，见 §4.6。
 
 ### 6.3 config/config.yaml（业务默认值，直接入库、随镜像打包）
 
-> 不含敏感信息，无 example 模板；密钥只走环境变量（§6.2）。
+> 不含敏感信息，无 example 模板；密钥走环境变量（§6.2），唯一例外是同样不入库的对外凭据清单 `config/.keys`（§4.6）。
 
 | 键 | 默认 | 说明 |
 |:---|:-----|:-----|
-| `models.auto.regex` | `[]` | auto 模式正则列表（仅作用于内置模型） |
-| `models.auto.exclude` | `[]` | 排除名单（国内不可用等） |
-| `models.auto.fallback` | 空 | 池为空时兜底模型 |
+| `models.allow` | `[]` | 模型白名单：全名命中任一正则才出现在 `/v1/models`，auto 也只从中选（空列表不过滤） |
+| `models.auto.exclude` | `[]` | auto 选池的排除名单（国内不可用等） |
+| `models.auto.fallback` | 空 | auto 池为空时兜底模型 |
 | `models.aliases` | `{}` | 内置模型短名映射（可选） |
 | `ollama.aliases` | `{}` | `短名 → ollama/<id>` 映射（可选） |
-| `web_search.model` | 空 | web-search 默认内置模型 |
+| `web_search.model` | 空 | 可选显式默认模型（支持别名）；留空自动取首个 `ollama-local/*`，无则 `models.auto.fallback` |
 | `web_search.synthesize_default` | `false` | 默认是否综合答案 |
-| `search.provider` | `duckduckgo` | 兜底搜索后端（默认免费） |
+| `search.provider` | `duckduckgo` | 兜底搜索后端：`duckduckgo` / `bing` 免费无需 key；`brave` 需 key；`custom` 自建 |
 | `search.base_url` | 空 | `custom` 后端地址（可选） |
 | `search.headers` | `{}` | `custom` 后端请求头（可选） |
 | `search.top_k` | `5` | 默认结果条数（API 可覆盖） |
@@ -303,28 +321,25 @@ flowchart LR
 
 > `top_k` / `max_chars_per_page` 已**移除环境变量**，改为 `config/config.yaml` 默认值 + API 请求参数覆盖。
 
-### 6.4 config/opencode.json（Ollama provider，随镜像打包）
+### 6.4 推理用量日志
 
-> 模板为 `config/opencode.json.example`；实际文件含本机地址，不入库（gitignored）。
+每次推理成功（`chat` / `responses` / `messages` 的流式与非流式、`web_search` 的 `synthesize`）由 `src/core/usage.mjs` 记一条 `event=usage` 的结构化 info 日志：
+`endpoint`、`model`、`stream`、`prompt_tokens`（`tokens.input + tokens.cache.read`）、`completion_tokens`、`reasoning_tokens`、`cache_read`、`cache_write`、`cost`、`duration_ms`。
+不新增存储依赖；失败请求不记用量，走常规 error 日志。
+
+### 6.5 config/opencode.json（provider 与检索后端，运行期挂载）
+
+> 模板为 `config/opencode.json.example`；实际文件含本机地址，不入库（gitignored），也不进镜像层。
+> Docker 中 `./config` 只读挂载到 `/app/config`，由 `OPENCODE_CONFIG_DIR` 指向；改完重启容器即生效。
 > 本地直跑时网关 spawn 的 `opencode serve` 只自动发现项目根 / 全局的 `opencode.json`，
-> 需以 `OPENCODE_CONFIG=./config/opencode.json` 指向本文件（Docker 内由镜像放到全局目录，无需该变量）。
+> 需以 `OPENCODE_CONFIG=./config/opencode.json` 指向本文件。
 
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "ollama": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "Ollama (local)",
-      "options": { "baseURL": "http://host.docker.internal:11434/v1" },
-      "models": { "qwen3:4b": { "name": "Qwen3 4B (local)" } }
-    }
-  }
-}
-```
+2.x 配置格式为 `providers.<id>.package/settings/models`，完整字段见 `config/opencode.json.example`，不在文档重复维护。
 
-- 实际推理走 OpenCode 的 `provider.ollama`；网关经 `model.list()` 读取已声明模型做校验与 `/v1/models` 展示。
+- 实际推理走 OpenCode 的 `providers` 声明（如 `ollama-local`）；网关经 `model.list()` 读取已声明模型做校验与 `/v1/models` 展示。
 - `OLLAMA_BASE_URL` / `OLLAMA_MODELS` 环境变量**移除**，统一由该文件管理。
+- **服务端 websearch 主路径靠「provider 声明」，不靠密钥**：2.x 未声明 provider 时 `websearch.query()` 直接返回 `Web search provider is required`。宿主机跑过交互式 opencode，声明会持久化在它自己的状态库（`~/.local/share/opencode/opencode.db` 的 `kv` 表：`websearch:provider = "random"`）；容器是全新 OpenCode home，没有这条记录，所以要在配置里声明。实测：容器内仅声明 `{"websearch":{"provider":"random"}}`、不配任何凭据，即可拿到 `engine=opencode-websearch`（服务端自选后端）；要固定 tavily/exa 等才需要额外提供对应 `*_API_KEY`。
+  声明方式两种：`config/opencode.json` 的 `websearch.provider`，或环境变量 `OPENCODE_CONFIG_CONTENT`（镜像已预设前者所需的 `random`，见 §6.1）。与 `OPENCODE_DISABLE_*` 精简变量无关——实测取消全部精简变量仍报错，补上声明立刻可用。
 
 ---
 
@@ -336,13 +351,16 @@ flowchart LR
 |:-----|:-----|:-------|:-----|
 | `GET` | `/health` | 自定义 | 健康检查（含后端连通性） |
 | `GET` | `/v1/models` | OpenAI | 模型列表（含虚拟模型 `auto` 与 Ollama 声明） |
+| `GET` | `/v1/aliases` | 自定义 | 模型别名列表（`models.aliases` / `ollama.aliases` 的配置声明） |
 | `POST` | `/v1/chat/completions` | OpenAI | Chat Completions（SSE 流式） |
 | `POST` | `/v1/responses` | OpenAI | Responses API（SSE 流式） |
 | `POST` | `/v1/messages` | Anthropic | Messages API（兼容 Claude SDK，SSE 流式） |
-| `POST` | `/v1/web_search` | 自定义 | **独立 web-search API**（需指定内置模型） |
+| `POST` | `/v1/web_search` | 自定义 | **独立 web-search API**（`model` 可省略/别名） |
+| `GET` | `/docs` | 文档 | Swagger UI（交互式文档，实现辅助） |
+| `GET` | `/docs/json` | 文档 | OpenAPI 3.1 JSON（由路由 schema 生成） |
 
 - 推理三端点（`chat` / `responses` / `messages`）均支持 `model: "auto"`、`<provider>/<id>` 内置模型、以及 `ollama/<id>`。
-- **`web_search` 是独立 API**，不内嵌为工具；请求 `model` 必须为**内置模型**（拒绝 `auto` / `ollama/...`），可用 config/config.yaml `web_search.model` 设默认。
+- **`web_search` 是独立 API**，不内嵌为工具；仅 `query` 必填，`model` 可省略（`web_search.model` → 首个 `ollama-local/*` → `models.auto.fallback`）或使用别名；显式指定时拒绝 `auto` / `ollama/<id>`。
 - 模型命名与解析规则见 [api.md §7](./api.md)；端点细节见 [api.md §8](./api.md)。
 - 错误统一格式：`{ "error": { "message", "type", "code" } }`，常见 `401/400/502/503` 见 api.md §2.4。
 
@@ -364,8 +382,8 @@ curl -X POST http://127.0.0.1:10000/v1/chat/completions \
 |:-------------|:-----------|
 | **客户端与 serve 版本耦合** | `@opencode/client` 由 server OpenAPI 生成，必须在 Dockerfile 锁定 `@opencode/cli` 与 `@opencode/client` 同版本；跨版本字段直接对不上，不做多版本兼容。 |
 | **免费模型不固定 & 国内不可用** | 这是 `auto` 模式的立项动机；用正则 + 排除名单 + 随机 + TTL 缓存缓解。 |
-| **web-search 国内可用性** | 服务端 websearch 优先，兜底 `duckduckgo` 在国内不稳；生产建议 bing/brave 或国内代理，并在 README 标注。 |
-| **web-search 指定模型** | 独立 API 需绑定**内置模型**；config/config.yaml `web_search.model` 提供默认，避免 `auto`/Ollama 干扰链路。 |
+| **web-search 国内可用性** | 服务端 websearch 优先；兜底 provider 中 `duckduckgo` / `bing` 免费免 key（`duckduckgo` 国内不稳），`brave` 需 key，`custom` 可接国内网关。 |
+| **web-search 模型默认值** | `model` 可省略：`web_search.model` → 首个 `ollama-local/*` → `models.auto.fallback`，避免默认绑定某款易下线模型；显式仍拒绝 `auto` / `ollama/<id>`。 |
 | **流式保真** | 2.x 以 `/api/event` SSE 事件流驱动；`session.text.delta` 转发增量，`wait` 后以最终助手消息全文对账补发（订阅窗口外丢失一次性补齐）。 |
 | **消息列表排序陷阱** | 2.x `message.list` 默认**新→旧**；适配层固定 `order:"asc"`（旧→新）后取末条 assistant，否则续接会话会取到旧轮结果。 |
 | **会话生命周期与并发** | OpenCode session 需按时清理；网关用 TTL 映射表（`session.ttl_min`）+ 用完即删（无续接语义的端点），避免后端堆积。 |

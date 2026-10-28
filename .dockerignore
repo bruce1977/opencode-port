@@ -1,4 +1,4 @@
-# 构建上下文瘦身：这些内容进镜像只会变大，且可能覆盖镜像内已安装的依赖
+# Slim build context: these only bloat the image and may shadow the dependencies installed inside it
 node_modules
 npm-debug.log*
 coverage
@@ -10,11 +10,16 @@ logs
 .gitignore
 .github
 
-# 密钥只走运行期环境变量，绝不进镜像层
+# Secrets come from runtime environment variables only and must never enter an image layer
 .env
 .env.*
 
-# 文档与测试不进运行镜像（config/ 必须保留：Dockerfile 会显式 COPY config/config.yaml 与 config/opencode.json）
+# Docs and tests stay out of the runtime image (config/config.yaml is packaged with it)
 docs
 tests
 *.md
+
+# Provider config holds local addresses/keys: mounted read-only from ./config at runtime, never baked into an image layer
+config/opencode.json
+# Accepted API keys live in the same mounted directory; the template config/.keys.example may be packaged, the real file may not
+config/.keys

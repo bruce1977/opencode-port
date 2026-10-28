@@ -1,11 +1,11 @@
-// 统一对外错误：{ error: { message, type, code } }（api.md §2.4）。
-// 放在 core 层以便 api / tools 共用（依赖方向 api/tools → core）。
+// Unified client-facing error shape: { error: { message, type, code } } (api.md §2.4).
+// Lives in core so both api and tools can share it (dependency direction api/tools → core).
 export class ApiError extends Error {
   /**
-   * @param {number} status HTTP 状态码
-   * @param {string} message 对客户端可见的中文描述
-   * @param {string} type OpenAI 风格错误 type
-   * @param {string} code 机器可读错误码
+   * @param {number} status HTTP status code
+   * @param {string} message description shown to the client (Chinese contract text)
+   * @param {string} type OpenAI-style error type
+   * @param {string} code machine-readable error code
    */
   constructor(status, message, type, code) {
     super(message);
@@ -15,7 +15,7 @@ export class ApiError extends Error {
     this.code = code;
   }
 
-  /** 转成对外 JSON 响应体 */
+  /** Convert to the client-facing JSON error body */
   toResponse() {
     return { error: { message: this.message, type: this.type, code: this.code } };
   }
@@ -38,6 +38,14 @@ export const endpointNotFound = (path) =>
 
 export const upstreamError = (message, code = "opencode_unavailable") =>
   new ApiError(502, message, "upstream_error", code);
+
+// OpenCode free-model quota exhausted (provider.free-limit) and common rate-limit errors → 429 (api.md §2.4)
+const QUOTA_PATTERN = /free[- ]limit|rate limit|quota|too many requests|\b429\b/i;
+
+/** Normalize model-side errors: quota/rate limit → 429 quota_exceeded, otherwise → 502 opencode_unavailable */
+export const promptUpstreamError = (message) => (QUOTA_PATTERN.test(message)
+  ? new ApiError(429, `推理失败：${message}`, "rate_limit_error", "quota_exceeded")
+  : upstreamError(`推理失败：${message}`));
 
 export const noAvailableModel = (message) =>
   new ApiError(503, message, "service_unavailable", "no_available_model");

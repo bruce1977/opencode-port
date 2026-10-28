@@ -1,30 +1,39 @@
-// 配置层：集中校验「环境变量（部署/敏感）」与「config/config.yaml（业务默认值）」，
-// 对业务层只暴露 AppConfig（AGENTS.md §5：业务代码不出现 process.env）。
-import { readFileSync } from "node:fs";
+// Config layer: validates environment variables (deployment/secrets), config/config.yaml (business defaults)
+// and the API keys file (one key per line), exposing only AppConfig to the business layer
+// (AGENTS.md §5: no process.env in business code).
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { z } from "zod";
 import YAML from "yaml";
 
-// env 里的布尔值：不能用 z.coerce.boolean()（"false" 会被转成 true）
+// Boolean values in env: z.coerce.boolean() cannot be used ("false" would become true)
 const boolish = z.preprocess((value) => {
   if (typeof value === "boolean") return value;
   if (value === undefined || value === "") return false;
   return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
 }, z.boolean());
 
+// Compose injects `${VAR:-}` as an empty string: an empty optional must mean "unset", not a validation error
+const optionalText = z.preprocess(
+  (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+  z.string().trim().min(1).optional(),
+);
+
 const envSchema = z.object({
   PORT: z.coerce.number().int().min(1).max(65535).default(10000),
   OPENCODE_SERVER_PORT: z.coerce.number().int().min(1).max(65535).default(10001),
-  OPENCODE_SERVER_URL: z.string().trim().min(1).optional(),
+  OPENCODE_SERVER_URL: optionalText,
   OPENCODE_SERVER_PASSWORD: z.string().default(""),
   API_KEY_ENABLED: boolish.default(false),
+  // Additional single key, merged with the keys file (useful for `-e API_KEY=...` one-off access)
   API_KEY: z.string().default(""),
+  API_KEYS_FILE: optionalText.default("./config/.keys"),
   SEARCH_API_KEY: z.string().default(""),
   CONFIG_PATH: z.string().trim().min(1).default("./config/config.yaml"),
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
 });
 
-// config.yaml 里的正则：编译失败要在启动期就炸出来，而不是等到第一次 auto 请求
+// Regexes in config.yaml: a compile failure must fail fast at startup, not on the first auto request
 const regexString = z.string().refine((value) => {
   try {
     new RegExp(value);
@@ -32,15 +41,18 @@ const regexString = z.string().refine((value) => {
   } catch {
     return false;
   }
-}, { message: "不是合法的正则表达式" });
+}, { message: "is not a valid regular expression" });
 
 const fileSchema = z.object({
   models: z.object({
+    // Allowlist for both /v1/models and the auto pool: full model names must match one of these
+    // regexes; an empty list means no filtering
+    allow: z.array(regexString).default([]),
     auto: z.object({
-      regex: z.array(regexString).default([]),
       exclude: z.array(z.string()).default([]),
       fallback: z.string().default(""),
-      // zod 4：.default() 直接作为输出不再过 schema；.prefault() 才会用空对象跑默认值解析
+      // zod 4: .default() is used as the output directly and skips schema parsing;
+      // only .prefault() parses defaults from an empty object
     }).prefault({}),
     aliases: z.record(z.string(), z.string()).default({}),
   }).prefault({}),
@@ -64,13 +76,14 @@ const fileSchema = z.object({
 });
 
 /**
- * 极简 .env 加载（`npm start` / `npm run dev` 默认生效）。
- * 语义对齐 dotenv：KEY=VALUE，# 注释与空行跳过，可选 export 前缀与引号，
- * **已存在的环境变量优先**（真实 env 覆盖 .env）；文件不存在时静默跳过（容器内无 .env 属正常）。
- * 不引入 dotenv 依赖（AGENTS.md §2：运行期依赖 4 个上限）；够用即可，不追求完整 dotenv 语法。
- * @param {string} [path] .env 路径（相对进程 cwd）
- * @param {Record<string, string | undefined>} [env] 注入用（测试传对象，默认 process.env）
- * @returns {boolean} 是否成功加载了文件
+ * Minimal .env loader (active by default for `npm start` / `npm run dev`).
+ * Semantics follow dotenv: KEY=VALUE, skip # comments and blank lines, optional export prefix and quotes,
+ * **already existing environment variables win** (real env overrides .env); a missing file is skipped
+ * silently (having no .env inside a container is expected).
+ * No dotenv dependency (AGENTS.md §2: runtime dependency budget); good enough, full dotenv syntax not required.
+ * @param {string} [path] .env path (relative to the process cwd)
+ * @param {Record<string, string | undefined>} [env] injection point (tests pass an object, defaults to process.env)
+ * @returns {boolean} whether the file was loaded successfully
  */
 export function loadDotEnv(path = ".env", env = process.env) {
   let raw;
@@ -96,13 +109,38 @@ export function loadDotEnv(path = ".env", env = process.env) {
   return true;
 }
 
+/**
+ * Read the API keys file: one **plaintext** key per line (no encryption, no hashing, no {env:VAR}
+ * interpolation — the line is the key), blank lines and `#` comment lines ignored.
+ * A missing file yields an empty list (auth then relies on `API_KEY` alone, or refuses everything if none).
+ * Lines are trimmed and deduplicated in order; the first key is also used by the self-test as the Bearer token.
+ * @param {string} path
+ * @returns {string[]}
+ */
+export function readApiKeys(path) {
+  let raw;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (error) {
+    if (error && error.code === "ENOENT") return [];
+    throw new Error(`API keys file ${path} could not be read: ${error.code ?? error.message}`, { cause: error });
+  }
+  const keys = [];
+  for (const line of raw.replace(/^\uFEFF/, "").split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    if (!keys.includes(trimmed)) keys.push(trimmed);
+  }
+  return keys;
+}
+
 function parse(schema, input, label) {
   const result = schema.safeParse(input);
   if (!result.success) {
     const detail = result.error.issues
       .map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
       .join("; ");
-    throw new Error(`${label} 校验失败：${detail}`);
+    throw new Error(`${label} validation failed: ${detail}`);
   }
   return result.data;
 }
@@ -112,17 +150,17 @@ function readYamlFile(path) {
   try {
     raw = readFileSync(path, "utf8");
   } catch (error) {
-    if (error && error.code === "ENOENT") return null; // 未提供配置文件时全部走默认值
+    if (error && error.code === "ENOENT") return null; // no config file: use defaults for everything
     throw error;
   }
   try {
     return YAML.parse(raw) ?? {};
   } catch (error) {
-    throw new Error(`配置文件 ${path} 不是合法 YAML：${error.message}`, { cause: error });
+    throw new Error(`Config file ${path} is not valid YAML: ${error.message}`, { cause: error });
   }
 }
 
-/** 小写化别名表的键（模型名解析大小写不敏感，api.md §7.1） */
+/** Lowercase the keys of an alias table (model name resolution is case-insensitive, api.md §7.1) */
 function lowerKeys(record) {
   const out = {};
   for (const [key, value] of Object.entries(record)) {
@@ -132,13 +170,15 @@ function lowerKeys(record) {
 }
 
 /**
- * 加载并校验全部配置。
- * @param {Record<string, string | undefined>} [env] 注入用（测试传对象，默认 process.env）
+ * Load and validate all configuration.
+ * @param {Record<string, string | undefined>} [env] injection point (tests pass an object, defaults to process.env)
  */
 export function loadConfig(env = process.env) {
-  const raw = parse(envSchema, env, "环境变量");
+  const raw = parse(envSchema, env, "Environment variables");
   const configPath = resolve(raw.CONFIG_PATH);
-  const file = parse(fileSchema, readYamlFile(configPath) ?? {}, `配置文件 ${configPath}`);
+  const file = parse(fileSchema, readYamlFile(configPath) ?? {}, `Config file ${configPath}`);
+  const keysFilePath = resolve(raw.API_KEYS_FILE);
+  const apiKeys = [...new Set([raw.API_KEY, ...readApiKeys(keysFilePath)].filter((key) => key !== ""))];
 
   return Object.freeze({
     port: raw.PORT,
@@ -147,12 +187,18 @@ export function loadConfig(env = process.env) {
     serverUrl: raw.OPENCODE_SERVER_URL ?? "",
     serverPassword: raw.OPENCODE_SERVER_PASSWORD,
     apiKeyEnabled: raw.API_KEY_ENABLED,
-    apiKey: raw.API_KEY,
+    /** First accepted key (the self-test calls our own /health with it); the full set is in `apiKeys` */
+    apiKey: apiKeys[0] ?? "",
+    apiKeys: Object.freeze(apiKeys),
+    apiKeysFile: keysFilePath,
+    apiKeysFileFound: existsSync(keysFilePath),
     searchApiKey: raw.SEARCH_API_KEY,
     configPath,
+    allow: Object.freeze({
+      regex: file.models.allow.map((pattern) => new RegExp(pattern, "i")),
+      sources: file.models.allow,
+    }),
     auto: Object.freeze({
-      regex: file.models.auto.regex.map((pattern) => new RegExp(pattern, "i")),
-      regexSources: file.models.auto.regex,
       exclude: file.models.auto.exclude.map((name) => name.toLowerCase()),
       fallback: file.models.auto.fallback,
     }),

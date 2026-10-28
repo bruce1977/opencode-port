@@ -1,6 +1,6 @@
-// 本项目 .mjs 源码的合规检查（规范正文见 AGENTS.md「JS 代码规范」）。
-// 分工：这里只放「AST 能判定」的规则；配置单源、产物字段这类判不出来的，
-// 由测试与文档守，不在 lint 里重复实现（两处都能改同一件事 = 互相掩盖）。
+// Compliance checks for this project's .mjs sources (see the "JS code standards" section of AGENTS.md).
+// Division of labour: only rules an AST can decide live here; anything undecidable
+// (single config source, generated payload fields) stays guarded by tests and docs, never duplicated in lint.
 import js from "@eslint/js";
 import globals from "globals";
 
@@ -8,7 +8,7 @@ const SOURCES = ["src/**/*.mjs", "scripts/**/*.mjs", "tests/**/*.mjs"];
 
 export default [
   {
-    // 生成物 / 第三方 / 非 JS 资源不参与检查
+    // build output / third-party / non-JS assets are not checked
     ignores: [
       "node_modules/**",
       "coverage/**",
@@ -29,11 +29,11 @@ export default [
       globals: { ...globals.node },
     },
     linterOptions: {
-      // 禁止用 eslint-disable 悄悄消音：禁用了没生效同样报错
+      // no silent silencing via eslint-disable: an unused directive is an error too
       reportUnusedDisableDirectives: "error",
     },
     rules: {
-      // —— L2 语法与风格（AGENTS.md「JS 代码规范」的机器可判定部分）——
+      // -- L2 syntax and style (the machine-decidable part of AGENTS.md "JS code standards") --
       indent: ["error", 2, { SwitchCase: 1 }],
       quotes: ["error", "double", { avoidEscape: true, allowTemplateLiterals: true }],
       semi: ["error", "always"],
@@ -45,7 +45,7 @@ export default [
       "no-undef": "error",
       "no-shadow": "error",
       "no-await-in-loop": "off",
-      // Node ESM：相对 import/export 必须带 .mjs 扩展名（漏了就 ERR_MODULE_NOT_FOUND）
+      // Node ESM: relative import/export specifiers must carry the .mjs extension (otherwise ERR_MODULE_NOT_FOUND)
       "no-restricted-syntax": [
         "error",
         {
@@ -65,7 +65,7 @@ export default [
     },
   },
   {
-    // —— L1 分层：core 是机制层，不得反向依赖 api / tools（依赖方向 api → core）——
+    // -- L1 layering: core is the mechanism layer and must not depend back on api / tools (direction: api -> core) --
     files: ["src/core/**/*.mjs"],
     rules: {
       "no-restricted-imports": [

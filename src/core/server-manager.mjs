@@ -1,5 +1,5 @@
-// 进程/服务层：拉起并管理 `opencode serve` 子进程，或复用外部实例。
-// design.md §5.1：startServe / stopServe / isHealthy，退出自动重启（带退避）。
+// Process/service layer: launches and manages the `opencode serve` child process, or reuses an external instance.
+// design.md §5.1: startServe / stopServe / isHealthy, automatic restart on exit (with backoff).
 import { spawn } from "node:child_process";
 import { connect } from "node:net";
 
@@ -11,7 +11,7 @@ const PORT_PROBE_TIMEOUT_MS = 1000;
 const LOCAL_HOST = "127.0.0.1";
 
 /**
- * TCP 探测端口是否已被监听（只看端口，不做协议识别）。
+ * TCP probe for whether a port is already listening (port only, no protocol detection).
  * @param {string} host
  * @param {number} port
  * @param {number} [timeoutMs]
@@ -45,14 +45,14 @@ export function createServerManager({ config, logger }) {
   let reused = false;
   let restartDelay = RESTART_BASE_MS;
 
-  /** 本地后端地址（端口来自 OPENCODE_SERVER_PORT） */
+  /** Local backend address (port comes from OPENCODE_SERVER_PORT) */
   function localUrl() {
     return `http://${LOCAL_HOST}:${config.serverPort}`;
   }
 
   /**
-   * 探测指定地址的 /api/info（2.x info 端点）。
-   * @returns {Promise<number|null>} HTTP 状态码；连不上（未监听 / 非 HTTP 服务）返回 null
+   * Probe /api/info on the given address (2.x info endpoint).
+   * @returns {Promise<number|null>} HTTP status code; null when unreachable (not listening / not an HTTP service)
    */
   async function probeStatus(url) {
     const controller = new AbortController();
@@ -71,15 +71,15 @@ export function createServerManager({ config, logger }) {
     }
   }
 
-  /** 外部实例 / 已复用实例：仅做健康探测（401 也说明进程活着） */
+  /** External instance / reused instance: health probe only (a 401 still means the process is alive) */
   function probeAlive(url) {
     return probeStatus(url).then((status) => status !== null && status < 500);
   }
 
   /**
-   * 启动 `opencode serve`。
-   * Windows 下 npm 全局安装的是 `opencode.cmd` 垫片，Node 的 spawn 不能直接执行 .cmd，
-   * 因此显式经 `cmd.exe /c` 启动；参数仅含固定 host 与数字端口，不含用户可控字符串。
+   * Start `opencode serve`.
+   * On Windows, a global npm install provides the `opencode.cmd` shim, which Node's spawn cannot execute directly,
+   * so launch it explicitly through `cmd.exe /c`; the arguments contain only a fixed host and a numeric port, no user-controlled strings.
    * @param {string[]} args
    * @param {NodeJS.ProcessEnv} env
    */
@@ -96,12 +96,12 @@ export function createServerManager({ config, logger }) {
     return spawn("opencode", args, options);
   }
 
-  /** 结束子进程；Windows 下 cmd 垫片会再 fork opencode，必须杀整棵进程树，否则端口不会释放 */
+  /** Terminate the child process; on Windows the cmd shim forks opencode again, so the whole process tree must be killed or the port stays bound */
   function terminateChild(proc, signal = "SIGTERM") {
     if (!proc.pid) return;
     if (process.platform === "win32") {
       const killer = spawn("taskkill", ["/pid", String(proc.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
-      // 极少数无 taskkill 的环境：退回只结束外层进程，至少让 exit 事件按预期触发
+      // Environments without taskkill (rare): fall back to killing only the outer process, at least so the exit event fires as expected
       killer.on("error", () => proc.kill());
       killer.unref();
       return;
@@ -122,14 +122,14 @@ export function createServerManager({ config, logger }) {
         if (settled) return;
         settled = true;
         terminateChild(proc);
-        rejectStart(new Error(`opencode serve 启动超时（${START_TIMEOUT_MS}ms）：${output.slice(-2000)}`));
+        rejectStart(new Error(`opencode serve startup timed out (${START_TIMEOUT_MS}ms): ${output.slice(-2000)}`));
       }, START_TIMEOUT_MS);
 
       const onData = (chunk) => {
         const text = chunk.toString();
         output += text;
         if (settled) return;
-        // 启动标志：2.x 为 "server listening on http://..."，1.x 为 "opencode server listening on ..."
+        // Startup marker: 2.x prints "server listening on http://...", 1.x prints "opencode server listening on ..."
         const match = output.match(/server listening[^\n]*?(https?:\/\/[^\s]+)/);
         if (match) {
           settled = true;
@@ -146,7 +146,7 @@ export function createServerManager({ config, logger }) {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        rejectStart(new Error(`无法执行 opencode CLI（请确认已安装且在 PATH 中）：${error.message}`));
+        rejectStart(new Error(`cannot execute the opencode CLI (make sure it is installed and on PATH): ${error.message}`));
       });
 
       proc.on("exit", (code, signal) => {
@@ -154,18 +154,18 @@ export function createServerManager({ config, logger }) {
         child = null;
         if (!settled) {
           settled = true;
-          rejectStart(new Error(`opencode serve 启动即退出（code=${code} signal=${signal}）：${output.slice(-2000)}`));
+          rejectStart(new Error(`opencode serve exited immediately (code=${code} signal=${signal}): ${output.slice(-2000)}`));
           return;
         }
         if (stopping) return;
-        // 意外退出 → 退避重启（design.md §5.1）
-        logger.error({ code, signal }, "opencode serve 意外退出，准备自动重启");
+        // Unexpected exit → backoff restart (design.md §5.1)
+        logger.error({ code, signal }, "opencode serve exited unexpectedly, scheduling automatic restart");
         const delay = restartDelay;
         restartDelay = Math.min(restartDelay * 2, RESTART_MAX_MS);
         setTimeout(() => {
           if (stopping) return;
           startChild().catch((error) => {
-            logger.error({ err: error }, "opencode serve 重启失败");
+            logger.error({ err: error }, "failed to restart opencode serve");
           });
         }, delay);
       });
@@ -176,37 +176,37 @@ export function createServerManager({ config, logger }) {
     if (external) {
       const status = await probeStatus(config.serverUrl);
       if (status === null) {
-        logger.warn({ url: config.serverUrl }, "外部 opencode serve 当前不可达，网关仍按配置连接（/health 将显示 degraded）");
+        logger.warn({ url: config.serverUrl }, "external opencode serve is currently unreachable; gateway still connects per config (/health will show degraded)");
       } else {
-        logger.info({ url: config.serverUrl, status }, "复用外部 opencode serve 实例");
+        logger.info({ url: config.serverUrl, status }, "reusing external opencode serve instance");
       }
       return config.serverUrl;
     }
 
     const url = localUrl();
-    // 启动第一步：先看配置端口有没有被监听（TCP 层）。已有实例就直接用 client 连，不再 spawn。
+    // First startup step: check whether the configured port is listening (TCP layer). If an instance already exists, connect to it with the client instead of spawning.
     if (await isPortOpen(LOCAL_HOST, config.serverPort)) {
       reused = true;
       const status = await probeStatus(url);
       if (status === 200) {
-        logger.info({ url }, "端口已有 opencode serve 在运行，复用现有实例（不由网关管理其生命周期）");
+        logger.info({ url }, "port already has a running opencode serve, reusing existing instance (its lifecycle is not managed by the gateway)");
       } else if (status === 401) {
-        logger.warn({ url }, "端口已有服务但鉴权不通过：OPENCODE_SERVER_PASSWORD 与该实例不一致，client 调用将 401");
+        logger.warn({ url }, "port has a service but authentication failed: OPENCODE_SERVER_PASSWORD does not match that instance, client calls will get 401");
       } else {
-        // TCP 已开但 /api/info 不是 2.x 的响应：仍按需求直接连，便于对接反代/自定义封装；失败会在 /health 暴露。
+        // TCP is open but /api/info is not a 2.x response: still connect as configured, to support reverse proxies/custom wrappers; failures surface in /health.
         logger.warn(
           { url, status: status ?? "unreachable" },
-          "端口已监听但 /api/info 未返回正常响应，仍按配置直接连接（若非 OpenCode 服务请更换 OPENCODE_SERVER_PORT）",
+          "port is listening but /api/info did not return a valid response, connecting as configured anyway (change OPENCODE_SERVER_PORT if this is not an OpenCode service)",
         );
       }
       return url;
     }
 
-    // 端口空闲：按配置端口与密码拉起 `opencode serve`
+    // Port is free: launch `opencode serve` on the configured port with the configured password
     const startedUrl = await startChild();
     reused = false;
     restartDelay = RESTART_BASE_MS;
-    logger.info({ url: startedUrl }, "opencode serve 已启动");
+    logger.info({ url: startedUrl }, "opencode serve started");
     return startedUrl;
   }
 
@@ -225,19 +225,19 @@ export function createServerManager({ config, logger }) {
       });
       terminateChild(proc);
     });
-    logger.info("opencode serve 已停止");
+    logger.info("opencode serve stopped");
   }
 
-  /** @returns {Promise<boolean>} 后端是否可达 */
+  /** @returns {Promise<boolean>} whether the backend is reachable */
   async function isHealthy() {
     if (external) return probeAlive(config.serverUrl);
     if (reused) return probeAlive(localUrl());
     if (!child) return false;
-    // 子进程模式下由 SDK 健康探测负责（见 opencode-client.health），此处只看进程在不在
+    // In child-process mode the SDK health probe is authoritative (see opencode-client.health); here we only check the process exists
     return true;
   }
 
-  /** /health 用：external=显式指定实例 / reused=探测到已有实例 / managed=网关拉起的子进程 */
+  /** For /health: external=explicitly configured instance / reused=existing instance detected / managed=child process launched by the gateway */
   function mode() {
     if (external) return "external";
     return reused ? "reused" : "managed";

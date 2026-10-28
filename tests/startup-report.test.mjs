@@ -1,4 +1,4 @@
-// 启动清单展示单测：分组、排序、显示名与空列表兜底（不涉及模型解析规则）。
+// Startup report rendering unit tests: grouping, ordering, display names and the empty-list fallback (no resolution rules here).
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { formatModelCatalogue, writeModelCatalogue } from "../src/startup-report.mjs";
@@ -16,21 +16,21 @@ test("formatModelCatalogue：内置在前、自定义按 provider 分组，包�
     ollama: [entry("ollama", "qwen3:8b", "qwen3:8b")],
   });
 
-  assert.match(text, /可用模型：后端 3 个（3 个 provider）/);
-  assert.match(text, /内置 · opencode（1 个）/);
-  assert.match(text, /自定义 · local-ollama（1 个）/);
-  assert.match(text, /自定义 · ollama（1 个）/);
+  assert.match(text, /Available models: 3 from the backend \(3 providers\)/);
+  assert.match(text, /Built-in · opencode \(1\)/);
+  assert.match(text, /Custom · local-ollama \(1\)/);
+  assert.match(text, /Custom · ollama \(1\)/);
   assert.match(text, /opencode\/flint-40b-free {2}Flint 40B Free/);
-  // 显示名与 modelID 相同时不重复追加
+  // no duplicate suffix when the display name equals the modelID
   assert.match(text, /ollama\/qwen3:8b\n/);
-  assert.match(text, /虚拟 · auto/);
-  assert.ok(text.indexOf("opencode（") < text.indexOf("local-ollama（"));
+  assert.match(text, /Virtual · auto/);
+  assert.ok(text.indexOf("opencode (") < text.indexOf("local-ollama ("));
 });
 
 test("formatModelCatalogue：空列表给出可诊断提示", () => {
   const text = formatModelCatalogue({ builtins: [], ollama: [] });
-  assert.match(text, /后端 0 个/);
-  assert.match(text, /未返回可用模型/);
+  assert.match(text, /Available models: 0 from the backend/);
+  assert.match(text, /returned no usable models/);
 });
 
 test("writeModelCatalogue：写入传入的流并返回文本", () => {
