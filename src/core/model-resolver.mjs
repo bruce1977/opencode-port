@@ -6,7 +6,6 @@ const POOL_TTL_MS = 60000;
 // api.md §7.5: auto matches on its own; <namespace>/<model-id> allows : / _ . -; bare names go through the alias table (checked inside resolve)
 const MODEL_PATTERN = /^(auto|[a-z0-9._-]+(\/[a-z0-9._:/-]+)?)$/i;
 const OLLAMA_NAMESPACE = "ollama";
-const OLLAMA_LOCAL_PREFIX = "ollama-local/";
 const AUTO_ENTRY = Object.freeze({ id: "auto", owned_by: "gateway", description: "白名单内内置模型随机" });
 
 /**
@@ -18,8 +17,12 @@ const AUTO_ENTRY = Object.freeze({ id: "auto", owned_by: "gateway", description:
  */
 export function createModelResolver({ client, config, logger, random = Math.random }) {
   let cache = { at: 0, builtins: [], ollama: [] };
+  const localPrefix = config.localProviderPrefix;
 
-  /** Fetch the model list and normalize it into { builtins, ollama } (disabled/deprecated/alpha models are excluded) */
+  /** Fetch the model list and normalize it into { builtins, ollama } (disabled/deprecated/alpha models are excluded).
+   * Only OpenCode's own `ollama` namespace goes into the `ollama` bucket; a custom local provider
+   * (OLLAMA_LOCAL_PROVIDER) is a normal provider and stays in `builtins` so /v1/models reports its real owned_by.
+   * `models.allow` is deliberately NOT applied here: it filters the listing, not resolvability (api.md §7.4). */
   async function refreshPool(force = false) {
     if (!force && Date.now() - cache.at < POOL_TTL_MS) return cache;
     const models = await client.listModels();
@@ -32,11 +35,8 @@ export function createModelResolver({ client, config, logger, random = Math.rand
       const modelID = model.modelID ?? model.id ?? "";
       if (!providerID || !modelID) continue;
       const entry = { providerID, modelID, name: `${providerID}/${modelID}`, info: model };
-      if (providerID === OLLAMA_NAMESPACE) {
-        ollama.push(entry);
-      } else {
-        builtins.push(entry);
-      }
+      if (providerID === OLLAMA_NAMESPACE) ollama.push(entry);
+      else builtins.push(entry);
     }
     cache = { at: Date.now(), builtins, ollama };
     logger.debug({ builtins: builtins.length, ollama: ollama.length }, "model pool refreshed");
@@ -51,10 +51,10 @@ export function createModelResolver({ client, config, logger, random = Math.rand
   /** auto pool: models.allow match → exclusion list → random; empty pool falls back (api.md §7.2) */
   async function pickAuto() {
     const pool = await refreshPool();
-    // ollama-local is a custom provider (only registered in the builtins group); it never joins auto even if it matches allow (api.md §7.2)
+    // the custom local provider is not a built-in free model: it never joins auto even if it matches allow (api.md §7.2)
     const matched = pool.builtins.filter((model) => {
       const name = model.name.toLowerCase();
-      if (name.startsWith(OLLAMA_LOCAL_PREFIX)) return false;
+      if (name.startsWith(localPrefix)) return false;
       if (config.auto.exclude.includes(name)) return false;
       return matchesAllow(name);
     });
@@ -79,7 +79,9 @@ export function createModelResolver({ client, config, logger, random = Math.rand
   function requireOllama(id) {
     const found = cache.ollama.find((model) => model.modelID.toLowerCase() === id.toLowerCase());
     if (!found) {
-      throw modelNotFound(`未知 Ollama 模型：${OLLAMA_NAMESPACE}/${id}（需在 opencode.json 的 provider.ollama.models 声明）`);
+      throw modelNotFound(
+        `未知 Ollama 模型：${OLLAMA_NAMESPACE}/${id}（需在 opencode.json 的 providers.${OLLAMA_NAMESPACE}.models 声明）`,
+      );
     }
     return { providerID: OLLAMA_NAMESPACE, modelID: found.modelID, name: found.name };
   }
@@ -98,7 +100,7 @@ export function createModelResolver({ client, config, logger, random = Math.rand
 
     if (lower === "auto") return pickAuto();
 
-    // 2. ollama short-name mapping
+    // 2. ollama short-name mapping (a target may name the local provider, e.g. ollama-local/qwen3.5:9b)
     const ollamaAlias = config.ollamaAliases[lower];
     if (ollamaAlias) return resolve(ollamaAlias);
 
@@ -106,7 +108,7 @@ export function createModelResolver({ client, config, logger, random = Math.rand
     const builtinAlias = config.modelAliases[lower];
     if (builtinAlias) return resolve(builtinAlias);
 
-    // 4. ollama/<id>
+    // 4. ollama/<id> (the built-in namespace; a custom local provider is resolved as a normal provider below)
     if (lower.startsWith(`${OLLAMA_NAMESPACE}/`)) {
       return requireOllama(name.slice(OLLAMA_NAMESPACE.length + 1));
     }
@@ -129,14 +131,15 @@ export function createModelResolver({ client, config, logger, random = Math.rand
 
   /**
    * Model resolution for web-search (api.md §8.2): an explicit model (aliases supported) wins;
-   * when omitted, try web_search.model → first ollama-local/* → models.auto.fallback in order.
+   * when omitted, try web_search.model → first local-provider model → models.auto.fallback in order.
    * Default candidates come from config/live model pool; on failure try the next one so a stale default cannot break the endpoint.
    */
   async function resolveWebSearchModel(requested) {
     if (requested) return resolveBuiltinOnly(requested);
 
     const pool = await refreshPool();
-    const firstLocal = pool.builtins.find((model) => model.name.toLowerCase().startsWith(OLLAMA_LOCAL_PREFIX));
+    // a custom local provider lives in `builtins` (it is a normal provider), so the default is picked there
+    const firstLocal = pool.builtins.find((model) => model.name.toLowerCase().startsWith(localPrefix));
     const candidates = [config.webSearch.model, firstLocal?.name, config.auto.fallback].filter(Boolean);
 
     const tried = new Set();
@@ -150,7 +153,9 @@ export function createModelResolver({ client, config, logger, random = Math.rand
         logger.warn({ model: candidate }, "web-search default model unavailable, trying next candidate");
       }
     }
-    throw noAvailableModel("web-search 未指定 model，且无可用默认模型（检查 ollama-local/*、web_search.model 或 models.auto.fallback）");
+    throw noAvailableModel(
+      `web-search 未指定 model，且无可用默认模型（检查 ${localPrefix}*、web_search.model 或 models.auto.fallback）`,
+    );
   }
 
   /** /v1/models: auto + builtins + declared ollama (api.md §3) */
@@ -163,12 +168,24 @@ export function createModelResolver({ client, config, logger, random = Math.rand
     };
   }
 
-  /** Public /v1/models listing: only models matching models.allow; the virtual auto entry is always returned */
+  /** /v1/models listing: only models matching models.allow; the virtual auto entry is always returned */
   async function listAllowed() {
     const pool = await refreshPool(true);
+    const builtins = pool.builtins.filter((model) => matchesAllow(model.name));
+    // Renaming OLLAMA_LOCAL_PROVIDER without updating the models.allow regexes silently drops every local
+    // model from /v1/models (and from the web-search default) — say so, because the symptom looks like Ollama being down.
+    if (
+      pool.builtins.some((model) => model.name.toLowerCase().startsWith(localPrefix)) &&
+      !builtins.some((model) => model.name.toLowerCase().startsWith(localPrefix))
+    ) {
+      logger.warn(
+        { localProvider: config.localProvider, allow: config.allow.sources },
+        "models.allow matched none of the local provider models (check the OLLAMA_LOCAL_PROVIDER name against the allow regexes)",
+      );
+    }
     return {
       auto: AUTO_ENTRY,
-      builtins: pool.builtins.filter((model) => matchesAllow(model.name)),
+      builtins,
       ollama: pool.ollama.filter((model) => matchesAllow(model.name)),
     };
   }

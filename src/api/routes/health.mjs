@@ -27,7 +27,7 @@ export function registerHealthRoutes(app, { ctx }) {
         tags: ["health"],
         summary: "健康检查",
         description:
-          "返回网关状态与 OpenCode 后端连通性；后端不可达时 status=degraded。开启 API_KEY 时需携带凭据（自测同样携带）。",
+          "返回网关状态与 OpenCode 后端连通性；后端不可达时 status=degraded（HTTP 仍为 200）。开启 API_KEY 时需携带凭据（Docker 健康探测同样携带）。",
         response: { 200: healthResponseSchema },
       },
     },

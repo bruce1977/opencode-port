@@ -5,7 +5,7 @@ models:
   # Allow list: a full model name (provider/model) must match one of these regexes to appear in /v1/models;
   # auto also picks at random only from the built-in models that match. An empty list means no filtering.
   allow:
-    - '^(?:opencode/(?:big-pickle|(?:deepseek|glm|mimo)-v\d+\.\d+(?:-flash)?-free)|ollama-local(?:/.*)?)$'
+    - '^(?:opencode/(?:big-pickle|(?:deepseek|glm|mimo)-v\d+\.\d+(?:-flash)?-free))$'
   auto:
     exclude: []                               # exclusion list (unavailable / unstable), removed from the auto pool
     fallback: "opencode/big-pickle"           # fallback when the pool is empty (built-in model id, e.g. opencode/flint-40b-free)
@@ -16,7 +16,8 @@ models:
 
 ollama:
   # short name -> ollama/<id>, e.g. { qwen: "ollama/qwen3:4b" }
-  # note: the Ollama models themselves must be declared in provider.ollama.models of config/opencode.json
+  # note: the Ollama models themselves must be declared in config/opencode.json, under
+  # providers.<OLLAMA_LOCAL_PROVIDER>.models (default id: ollama-local)
   aliases: { "qwen3.5":"ollama-local/qwen3.5:9b" }
 
 web_search:

@@ -77,7 +77,7 @@ export async function runWebSearch(ctx, params) {
   if (!query || typeof query !== "string" || !query.trim()) {
     throw badRequest("query 缺失或为空", "invalid_request");
   }
-  // Explicit model (aliases supported) → web_search.model → first ollama-local/* → models.auto.fallback
+  // Explicit model (aliases supported) → web_search.model → first local-provider model → models.auto.fallback
   const model = await ctx.resolver.resolveWebSearchModel(requestedModel);
 
   const effectiveTopK = topK ?? ctx.config.search.topK;

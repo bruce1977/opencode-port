@@ -3,6 +3,7 @@
 > 工作标题：`opencode-api-gateway`（可重命名）
 > 衍生自：[TiaraBasori/OpenCode2API](https://github.com/TiaraBasori/OpenCode2API)
 > 状态：设计阶段（待评审）
+> 相关文档：用法与端点示例 `README.md`｜接口契约（唯一事实源）`api.md`｜容器化部署与环境变量总表 `docker-deployment.md`｜协作与代码规范 `AGENTS.md`
 
 ---
 
@@ -133,7 +134,7 @@ sequenceDiagram
 - 若 `OPENCODE_SERVER_URL` 已指向外部运行实例，则**不**拉起子进程，仅做客户端连接（便于复用已登录态 / 多实例）；启动时会探测一次，不可达仅告警。
 - 鉴权：OpenCode server 端用 `OPENCODE_SERVER_PASSWORD`（用户名固定 `opencode`）做 HTTP Basic；客户端所有请求携带该凭据。
 - **启动清单**：网关监听成功后拉取一次 `model.list()`，按 provider 分组把内置模型与自定义模型（Ollama 等）输出到终端，并附虚拟模型 `auto`；拉取失败只告警，不阻塞启动。
-- **每分钟自测**：以 60s 间隔请求网关自身的 `/health`，记录状态、后端版本、延迟与连续失败次数；退出时先停自测再关网关与后端。
+- **健康探测不属于网关进程**：网关内不跑周期定时器，只在 `/health` 被动应答。容器层由 `Dockerfile` 的 `HEALTHCHECK` 每 30s 以独立进程请求 `/health`（`scripts/docker-healthcheck.mjs`，见 §5.8 与 §6.1）；本机 `npm start` 调试时同一脚本可手动执行一次。
 
 ### 4.2 推理请求流程
 
@@ -176,9 +177,10 @@ sequenceDiagram
 
 ### 4.4 Ollama 自定义模型接入
 
-- **配置位置**：Ollama 的 provider 配置写在 OpenCode 的 `config/opencode.json`（`provider.ollama`：`npm: @ai-sdk/openai-compatible` + `options.baseURL` + `models`），随 Docker 镜像打包；**不再通过环境变量**（`OLLAMA_BASE_URL` / `OLLAMA_MODELS` 移除）。
-- 模型全称对外暴露为 `ollama/<id>`；网关经 `model.list()` 读取已声明的 Ollama 模型，用于校验与 `/v1/models` 展示。
-- **命名规则**：`ollama/<ollama-model-id>`，`<id>` 必须与 `ollama list` 一致且在 `config/opencode.json` 中声明；可选 config/config.yaml `ollama.aliases` 短名映射。完整规则见 api.md §7.3。
+- **配置位置**：本地推理写成 OpenCode 的自定义 provider——`config/opencode.json` 的 `providers.<id>`（2.x：`package: "@opencode/ai/providers/openai-compatible"` + `settings.baseURL` / `settings.apiKey`（`{env:...}` 插值）+ `models`），并 `plugins: ["-opencode.provider.ollama"]` 关掉内置 `ollama`；随镜像打包（烘的是模板，§6.5）；**不再通过环境变量**（`OLLAMA_BASE_URL` / `OLLAMA_MODELS` 移除）。
+- **provider id 可配置**：`OLLAMA_LOCAL_PROVIDER`（默认 `ollama-local`）决定「哪些模型不进 `auto` 池」与 `web_search` 缺省取哪款本地模型；它必须与 `providers` 的键、`config.yaml` 的 `models.allow` 三处一致（§6.2、`docker-deployment.md` §3）。
+- 模型全称对外暴露为 `<id>/<model>`（如 `ollama-local/qwen3.5:9b`）；网关经 `model.list()` 读取已声明的模型，用于校验与 `/v1/models` 展示。
+- **命名规则**：`ollama/<ollama-model-id>` 那条路径属于 OpenCode **内置** provider（被上面 `plugins` 关掉后，需自行在 `providers.ollama.models` 声明才有模型）；`<id>` 必须与 `ollama list` 一致。可选 `config/config.yaml` 的 `ollama.aliases` 短名映射。完整规则见 api.md §7.3。
 - 客户端请求 `model: "ollama/qwen3:4b"` 即可走本地推理，零成本、可离线。
 - 注意：Ollama 工具调用需要足够 `num_ctx`，建议在 Ollama 侧适当调大（16k–32k）。
 
@@ -211,7 +213,7 @@ flowchart LR
 - key 清单默认从 **`config/.keys` 读取，一行一个**（空行与 `#` 注释忽略、去重），路径由 `API_KEYS_FILE` 覆盖；环境变量 `API_KEY` 追加进同一集合并排在最前（`config.apiKeys`）。
 - **文件内容是明文 key，读到就用**：不加解密、不哈希、不做 `{env:VAR}` 插值，也没有 key 与用户/权限的映射表；校验就是「任意一条与请求携带的值全等即放行」（用 `timingSafeEqual` 比较，长度不同直接判否）。
 - 多 key 只用于分发凭据与吊销单条，**不含配额、计费与路由语义**；默认仍只用免费资源，多用户付费 key 不纳入。
-- key 值只进内存与比较运算：不写日志、不进错误响应、不进镜像层（`config/.keys` 同时 gitignore 与 dockerignore，运行期由 `./config` 只读挂载提供）。启动时按状态打一条日志（只含路径与条数）：有 key → `info`；**文件没找到且 `API_KEY` 也为空 → `error`**（鉴权开着却没人能进来，最容易被误判成网关故障）；文件没找到但 `API_KEY` 有值 → `warn`；鉴权关闭且无文件 → `debug`。
+- key 值只进内存与比较运算：不写日志、不进错误响应、不进镜像层（`config/.keys` 同时 gitignore 与 dockerignore；容器里读到的是挂载的宿主文件或镜像 `touch` 出来的**空文件**）。启动时按状态打一条日志（只含路径与条数）：有 key → `info`；**文件没找到且 `API_KEY` 也为空 → `error`**（鉴权开着却没人能进来，最容易被误判成网关故障）；文件没找到但 `API_KEY` 有值 → `warn`；鉴权关闭且无文件 → `debug`。
 - `OPENCODE_SERVER_PASSWORD`（OpenCode 后端）与**本网关 API KEY 是两套独立凭据**：前者保护 OpenCode server，后者保护对外 API。
 
 ---
@@ -253,48 +255,56 @@ flowchart LR
 
 ### 5.7 配置层 `config.mjs`
 - 使用 `zod` 校验环境变量 + `config/config.yaml`，集中暴露 `AppConfig`。
-- `readApiKeys(path)` 读对外 key 清单（`API_KEYS_FILE`，默认 `config/.keys`）：一行一个、忽略空行与 `#` 注释、按出现顺序去重；文件缺失返回空数组（不报错），读不了则抛错让启动失败。`loadConfig` 把它与 `API_KEY` 合并成 `apiKeys`，`apiKey` 取第一个供自测携带。
+- `readApiKeys(path)` 读对外 key 清单（`API_KEYS_FILE`，默认 `config/.keys`）：一行一个、忽略空行与 `#` 注释、按出现顺序去重；文件缺失返回空数组（不报错），读不了则抛错让启动失败。`loadConfig` 把它与 `API_KEY` 合并成 `apiKeys`，`apiKey` 取第一个——健康探测脚本用它作为访问自身 `/health` 的 Bearer 凭据。
 - `loadDotEnv()` 供进程入口在配置校验前加载项目根 `.env`（真实环境变量优先），不引入 dotenv 依赖。
 
-### 5.8 启动清单与运行期自测
+### 5.8 启动清单与容器健康探测
 - `startup-report.mjs`：把 `resolver.listAll()` 的结果整理成终端可读清单（内置 provider 在前，自定义 provider 分组，附虚拟 `auto`）；只做展示，不参与解析。
-- `core/health-monitor.mjs`：`startHealthSelfTest()` 每 60s 请求网关自身 `/health`，带超时与 `AbortSignal`，失败只记 warn 并累计次数；`stop()` 可中止定时器与在途请求。
+- `scripts/docker-healthcheck.mjs`：Docker `HEALTHCHECK` 的执行体，独立进程、不由网关调度。复用 `loadConfig()` 取监听端口与第一个 key（不重复实现 `.keys` 解析），带超时与 `AbortSignal` 请求网关自身 `/health`；**只有 HTTP 2xx 且响应体 `status="ok"` 才退出 0**——`/health` 在后端不可达时仍返回 200（`degraded`），只看状态码会把坏链路判成健康。判定行写 stdout：这个进程里没有网关的 pino logger，而 stdout 正是 `docker inspect` 保留的健康日志。
 
 ---
 
 ## 6. 配置体系
 
-配置按**职责分层**：版本在 Dockerfile 固定，敏感/部署相关走环境变量，业务默认走 `config/config.yaml`，provider 与服务端检索后端声明走 OpenCode 自身配置。
+配置按**职责分层**：版本与**部署默认值**在 Dockerfile（镜像内 `ENV`，运行期可覆盖），真密钥走环境变量，业务默认走 `config/config.yaml`，provider 与服务端检索后端声明走 OpenCode 自身配置（`config/opencode.json`，镜像烘的是它的模板）。
 
-### 6.1 Dockerfile（版本绑定，非环境变量）
+### 6.1 Dockerfile（版本绑定 + 部署默认值）
 
 - `@opencode/cli` 与 `@opencode/client` 版本在**构建期**固定（`ARG OPENCODE_CLI_VERSION` / `package.json` + lockfile），随镜像固化；两者**必须同版本**（当前 `2.2.0`）。**不再提供** `OPENCODE_CLI_VERSION` / `SDK_VERSION` 环境变量。
-- `config/config.yaml`（直接入库）随镜像打包；`config/opencode.json` 含本机地址/密钥，**不进镜像**（`.dockerignore` 排除）。两者同处 `./config`，运行时整目录只读挂载到 `/app/config`，`OPENCODE_CONFIG_DIR` 指向该目录，只需一个卷。
+- `config/config.yaml`（直接入库）随镜像打包。**`config/opencode.json` 也随镜像打包**，但烘进去的是模板副本：`COPY config/opencode.json.example ./config/opencode.json`。原因是 opencode 2.2.0 **只读不写**这个文件（实测：全新镜像里没有，跑完 `opencode models` / `opencode serve` 也只创建状态库），不自带就没有任何自定义 provider；而真实 `config/opencode.json` 含本机地址、可能写明文密钥，由 `.dockerignore` 绝对排除，所以「烘模板 + 排除真文件」同时拿到一键部署与不进镜像层。挂载是**整目录替换**：`-v ./config:/app/config:ro` 后容器只看到宿主目录，目录里没放 `opencode.json` 连烘的那份一起消失（细节与单文件挂载写法见 `docker-deployment.md` §2.4）。
+- provider 端点**可达与否不影响部署**（实测：`baseURL` 指向不可解析主机、`OLLAMA_API_KEY` 不设置，provider 照样注册、模型照样进 `/v1/models`）：清单来自声明，推理才真正打过去，失败表现为 `502`，`/health` 仍是 `ok`（它探的是容器内 `opencode serve`，不是 Ollama）。
 - 镜像预设一组 OpenCode 精简变量：`OPENCODE_CONFIG_DIR=/app/config`、`OPENCODE_DISABLE_PROJECT_CONFIG`、`OPENCODE_DISABLE_CLAUDE_CODE`、`OPENCODE_DISABLE_CLAUDE_CODE_SKILLS`、`OPENCODE_DISABLE_AUTOUPDATE`、`OPENCODE_DISABLE_FILEWATCHER`（均为 `true`），减少每次请求固定注入的指令/技能/插件上下文。变量名逐个对 2.2.0 二进制核过；1.x 的 `OPENCODE_DISABLE_DEFAULT_PLUGINS` / `OPENCODE_DISABLE_LSP_DOWNLOAD` 在 2.x 已不被识别，故不再设置（留着只会给人「已经在裁剪」的错觉）。`OPENCODE_DISABLE_MODELS_FETCH` 同样存在，但它会影响内置模型目录，未验证不预设。
-- 部署相关的**非敏感项**在镜像里就有默认值（`PORT=10000`、`OPENCODE_SERVER_PORT=10001`、`LOG_LEVEL=info`、`CONFIG_PATH=/app/config/config.yaml`），与 `src/config.mjs` 的默认值一致；裸 `docker run` 也能起得来。`API_KEY_ENABLED` 只在 `src/config.mjs` 里默认 `false`，镜像**不写**这个 `ENV`：BuildKit 会把名字含 `API_KEY` 的变量当密钥报 `SecretsUsedInArgOrEnv`。
-- 镜像还预设 `OPENCODE_CONFIG_CONTENT={"websearch":{"provider":"random"}}`：给容器补上「跑过一次交互式 opencode」才会写进状态库的 websearch provider 声明（免凭据，见 §6.5）。运行期用 `-e`/compose 覆盖即可，注意它是整体替换而非合并。
-- 密钥项（`OPENCODE_SERVER_PASSWORD` / `API_KEY` / `SEARCH_API_KEY`，以及 provider 的 `OLLAMA_API_KEY` / `TAVILY_API_KEY`）在镜像里**完全不存在**：既不写成 `ARG`，也不留 `ENV` 声明（密钥名出现在 `ENV` 里就会触发 BuildKit 的 `SecretsUsedInArgOrEnv` 告警，`API_KEY_ENABLED` / `API_KEYS_FILE` 这类**名字**含 `API_KEY` 的非敏感变量同样会被误报，所以也只在 `src/config.mjs` 与 compose 里给值），真值一律由运行期注入（compose / `--env-file` / `-e`），因此不会进入镜像层与 `docker history`。
-- 对外 key 清单 `config/.keys` 同理：`.gitignore` + `.dockerignore` 双重排除，镜像里只有模板 `config/.keys.example`；容器靠 `./config:/app/config:ro` 这一处只读挂载拿到真值，代码默认 `./config/.keys` 在工作目录 `/app` 下就是 `/app/config/.keys`，无需任何额外配置。
-- **`API_KEYS_FILE` 不进镜像也不由 compose 转发**：`.env` 与本机环境变量描述的是**宿主机**路径（Windows 下形如 `D:\...\config\.keys`），原样注入容器会指向一个不存在的文件，`readApiKeys` 只能返回空清单，于是开启鉴权后所有请求 `401`（启动日志的 `keysFile` + `keyCount` 就是用来定位这件事的）。要改容器内路径只能在 `docker-compose.yml` 的 `environment` 里写字面容器路径。
-- **不配置 Docker `HEALTHCHECK`**：网关进程内已有 60s 周期自测（请求自身 `/health` 并记录延迟/版本/失败次数），容器层再探测属于重复。
+- 部署相关的**非敏感项**在镜像里就有默认值（`PORT=8000`、`OPENCODE_SERVER_PORT=10001`、`LOG_LEVEL=info`、`CONFIG_PATH=/app/config/config.yaml`、`API_KEY_ENABLED=false`、`API_KEYS_FILE=/app/config/.keys`、`OLLAMA_LOCAL_PROVIDER=ollama-local`），裸 `docker run` 也能起得来；每一项都是**默认值而非锁**，运行期 `-e` / `--env-file` 覆盖即可，不改镜像。与 `src/config.mjs` 不一致的地方只有端口（代码默认 `10000`，镜像 `8000`）与容器内路径，容器里以镜像为准。
+- `OPENCODE_SERVER_PASSWORD` 在镜像里给了占位值 `88888888`：这条凭据保护的是**容器内 `127.0.0.1`** 的 serve 监听，不是对外端口，但它是写死在镜像层里的固定值，所以文档要求上线前 `-e` 改掉，且**禁止**在设置 `OPENCODE_SERVER_URL` 连远端实例时沿用。留空更糟：网关拉起的 serve 会拒绝客户端，模型清单直接失败（实测报 `Authentication required`）。
+- `API_KEY_ENABLED` / `API_KEYS_FILE` 这两个**名字**含 `API_KEY` 的开关与路径会触发 BuildKit 的 `SecretsUsedInArgOrEnv` 告警。值是开关和路径、不是密钥，**告警属于预期**，不要为了消警告把它们挪回 `ARG` 或退回「只在代码里默认」。
+- 镜像还预设 `OPENCODE_CONFIG_CONTENT={"websearch":{"provider":"random"}}`：给容器补上「跑过一次交互式 opencode」才会写进状态库的 websearch provider 声明（免凭据，见 §6.5）。运行期用 `-e` 覆盖即可，注意它是整体替换而非合并。它只管这类键，**声明 `providers` 无效**（实测），所以 provider 配置必须走文件（§6.5）。
+- 真密钥项（`API_KEY` / `SEARCH_API_KEY`，以及 provider 的 `OLLAMA_API_KEY` / `TAVILY_API_KEY`）在镜像里**完全不存在**：既不写成 `ARG`，也不留 `ENV` 声明，真值一律由运行期注入（`-e NAME` / `--env-file`），因此不会进入镜像层与 `docker history`。`OLLAMA_API_KEY` 不给默认值还有个实际理由：镜像里那份 `{env:OLLAMA_API_KEY}` 缺值时插值成空串，provider 照样注册，只有端点真校验 key 才必须给。
+- 对外 key 清单 `config/.keys`：`.gitignore` + `.dockerignore` 双重排除，镜像里只有一个 `RUN touch` 出来的**空文件**（`API_KEYS_FILE` 的镜像默认值就指它）。空文件与「文件不存在」的差别只在日志：前者是「没有 key」，鉴权开着时所有请求 `401`；`API_KEY` 环境变量仍然追加进集合并排最前，所以不挂卷也能用单条 key 开鉴权。
+- **不要把宿主机的 `API_KEYS_FILE` 原样传进容器**：`.env` 与本机环境变量描述的是**宿主机**路径（Windows 下形如 `D:\...\config\.keys`），原样注入会指向一个不存在的文件，`readApiKeys` 只能返回空清单，于是开启鉴权后所有请求 `401`（启动日志的 `keysFile` + `keyCount` 就是用来定位这件事的）。要改容器内路径只能在 `docker run -e` 里写字面容器路径。
+- **Docker `HEALTHCHECK` 由容器层负责健康状态**：`--interval=30s --timeout=10s --start-period=30s --retries=3`，`CMD ["node", "/app/scripts/docker-healthcheck.mjs"]`（`node:22-slim` 无 `curl`，所以用 node 脚本而不是 shell 探测）。脚本本身从镜像里的 `/app/scripts` 读取，凭据来自容器内的 `/app/config/.keys`（挂载时是宿主那份，没挂载时是镜像里 `touch` 出来的空文件）与 `API_KEY` 环境变量，**不出现在 `HEALTHCHECK` 命令行里**（`docker inspect` 会原样展示 `Cmd`，写进去等于把 key 公开）。副作用需知情：开启鉴权而 `.keys` 为空时脚本一律拿到 401 ⇒ 容器显示 unhealthy，这是「没人能通过鉴权」的正确表达。
 
 ### 6.2 环境变量（部署相关 / 敏感）
 
-| 变量 | 默认 | 说明 |
-|:-----|:-----|:-----|
-| `PORT` | `10000` | 网关对外端口 |
-| `OPENCODE_SERVER_PORT` | `10001` | 后端端口（未设 `OPENCODE_SERVER_URL` 时生效） |
-| `OPENCODE_SERVER_URL` | 空 | 外部实例地址；设置后不拉起子进程，直接连接 |
-| `OPENCODE_SERVER_PASSWORD` | 空 | OpenCode server HTTP Basic 密码 |
-| `API_KEY_ENABLED` | `false` | 是否开启对外 API KEY 鉴权 |
-| `API_KEY` | 空 | 单个 key，追加进 `config/.keys` 的集合并排在最前 |
-| `API_KEYS_FILE` | `./config/.keys` | **对外 key 清单文件，一行一个**（空行/`#` 注释忽略、去重）。文件缺失只意味着「没有 key」，不报错；读不了（权限等）则启动失败 |
-| `SEARCH_API_KEY` | 空 | 仅使用付费搜索后端时需要；默认免费后端无需 |
-| `OLLAMA_API_KEY` | 空 | 网关不读，仅透传给 `opencode serve`：`config/opencode.json` 里 `{env:OLLAMA_API_KEY}` 插值用 |
-| `TAVILY_API_KEY` | 空 | 网关不读，仅透传给 `opencode serve`：固定某个检索后端时才需要（默认 `random` 免密钥） |
-| `OPENCODE_CONFIG_CONTENT` | 镜像预设 `{"websearch":{"provider":"random"}}` | 网关不读，透传给 `opencode serve` 的内联配置（整体替换镜像预设，见 §6.1） |
-| `CONFIG_PATH` | `./config/config.yaml` | 配置文件路径 |
-| `LOG_LEVEL` | `info` | 网关日志级别（fatal/error/warn/info/debug/trace/silent） |
+「代码默认」= `src/config.mjs` 的 zod 默认值（本机 `npm start` 用这套）；「镜像默认」= `Dockerfile` 的 `ENV`（容器里以它为准，运行期 `-e` 再覆盖）。**「不存在」是有意为之**：真密钥既不作 `ARG` 也不留 `ENV`，绝不进镜像层与 `docker history`。
+
+| 变量 | 代码默认 | 镜像默认 | 说明 |
+|:-----|:---------|:---------|:-----|
+| `PORT` | `10000` | `8000` | 网关监听端口（容器内）。对外端口是 `-p 宿主:容器` 的左侧，与 `EXPOSE` 无关 |
+| `OPENCODE_SERVER_PORT` | `10001` | `10001` | 后端端口（未设 `OPENCODE_SERVER_URL` 时生效） |
+| `OPENCODE_SERVER_URL` | 空 | 空 | 外部实例地址；设置后不拉起子进程，直接连接 |
+| `OPENCODE_SERVER_PASSWORD` | 空 | `88888888` | OpenCode server HTTP Basic 密码。镜像里那个是**占位**，只保护容器内 `127.0.0.1`，上线必须 `-e` 改掉（§6.1） |
+| `API_KEY_ENABLED` | `false` | `false` | 是否开启对外 API KEY 鉴权 |
+| `API_KEY` | 空 | **不存在** | 单个 key，追加进 `config/.keys` 的集合并排在最前 |
+| `API_KEYS_FILE` | `./config/.keys` | `/app/config/.keys` | **对外 key 清单文件，一行一个**（空行/`#` 注释忽略、去重）。文件缺失只意味着「没有 key」，不报错；读不了（权限等）则启动失败。**别把宿主机路径传进容器**（§6.1） |
+| `OLLAMA_LOCAL_PROVIDER` | `ollama-local` | `ollama-local` | 自定义本地 provider 的 id：决定哪些模型不进 `auto` 池、`web_search` 缺省取哪款本地模型。转小写、不能是保留名 `ollama`，且必须等于 `opencode.json` 里 `providers` 的键与 `models.allow` 里的写法（三处一致，`docker-deployment.md` §3） |
+| `SEARCH_API_KEY` | 空 | **不存在** | 仅使用付费搜索后端时需要；默认免费后端无需 |
+| `OLLAMA_API_KEY` | — | **不存在** | 网关不读，仅透传给 `opencode serve`：`config/opencode.json` 里 `{env:OLLAMA_API_KEY}` 插值用。不设置时插值成空串，provider 照样注册（实测） |
+| `TAVILY_API_KEY` | — | **不存在** | 网关不读，仅透传给 `opencode serve`：固定某个检索后端时才需要（默认 `random` 免密钥） |
+| `OPENCODE_CONFIG_CONTENT` | — | `{"websearch":{"provider":"random"}}` | 网关不读，透传给 `opencode serve` 的内联配置（整体替换镜像预设，见 §6.1；**不能**用来声明 provider） |
+| `CONFIG_PATH` | `./config/config.yaml` | `/app/config/config.yaml` | 配置文件路径 |
+| `LOG_LEVEL` | `info` | `info` | 网关日志级别（fatal/error/warn/info/debug/trace/silent） |
+
+> 空串等于未设置：`-e OPENCODE_SERVER_URL=` 或 `--env-file` 留空都会落回默认值（`src/config.mjs` 的 `emptyToUndefined`），不会因「空字符串不合法」启动失败。
 
 > 默认**尽量使用免费资源**：不配置付费模型 key、不使用付费搜索后端；`OPENCODE_API_KEYS`（多用户付费 key）仍不作为配置项。
 > 对外 API KEY 的**多 key** 不属于「付费 key」：它是一份等值凭据清单（`config/.keys`，一行一个），只用于分发与吊销，见 §4.6。
@@ -327,16 +337,16 @@ flowchart LR
 `endpoint`、`model`、`stream`、`prompt_tokens`（`tokens.input + tokens.cache.read`）、`completion_tokens`、`reasoning_tokens`、`cache_read`、`cache_write`、`cost`、`duration_ms`。
 不新增存储依赖；失败请求不记用量，走常规 error 日志。
 
-### 6.5 config/opencode.json（provider 与检索后端，运行期挂载）
+### 6.5 config/opencode.json（provider 与检索后端；镜像烘模板）
 
-> 模板为 `config/opencode.json.example`；实际文件含本机地址，不入库（gitignored），也不进镜像层。
-> Docker 中 `./config` 只读挂载到 `/app/config`，由 `OPENCODE_CONFIG_DIR` 指向；改完重启容器即生效。
-> 本地直跑时网关 spawn 的 `opencode serve` 只自动发现项目根 / 全局的 `opencode.json`，
-> 需以 `OPENCODE_CONFIG=./config/opencode.json` 指向本文件。
+> 模板 `config/opencode.json.example` 入库，且**构建期被复制成镜像里的 `/app/config/opencode.json`**（§6.1）——因为 opencode 2.2.0 只读不写这个文件，镜像不自带就没有任何自定义 provider，裸 `docker run` 就不算一次部署。
+> 真实 `config/opencode.json` 含本机地址、可能写明文密钥，**不入库（gitignored）也不进镜像层（`.dockerignore`）**；文件里的密钥一律写成 `{env:...}`，进镜像的那份因此不含凭据。
+> Docker 覆盖方式两种：`-v ./config:/app/config:ro`（**整目录替换**，宿主目录里没有 `opencode.json` 时连烘的默认值一起消失）或单文件挂载；改完 `docker restart` 生效。
+> 本地直跑时网关 spawn 的 `opencode serve` 只自动发现项目根 / 全局的 `opencode.json`，需以 `OPENCODE_CONFIG=./config/opencode.json` 指向本文件——但**实测**：Windows 宿主的 CLI 没采纳 `OPENCODE_CONFIG` / `OPENCODE_CONFIG_DIR` 里的 provider 声明（同一份文件在容器里生效），本机排查时先确认读到的是不是全局那一份。
 
-2.x 配置格式为 `providers.<id>.package/settings/models`，完整字段见 `config/opencode.json.example`，不在文档重复维护。
+2.x 配置格式为 `providers.<id>.package/settings/models`（**不是** 1.x 的 `provider.<id>.npm/options`），完整字段见 `config/opencode.json.example`，不在文档重复维护。`providers` 的键必须等于 `OLLAMA_LOCAL_PROVIDER`（§6.2、`docker-deployment.md` §3）。
 
-- 实际推理走 OpenCode 的 `providers` 声明（如 `ollama-local`）；网关经 `model.list()` 读取已声明模型做校验与 `/v1/models` 展示。
+- 实际推理走 OpenCode 的 `providers` 声明（默认 id `ollama-local`）；网关经 `model.list()` 读取已声明模型做校验与 `/v1/models` 展示。**声明即列出**：端点不可达、`OLLAMA_API_KEY` 未给都不影响清单，只有推理才真的打过去（§6.1）。
 - `OLLAMA_BASE_URL` / `OLLAMA_MODELS` 环境变量**移除**，统一由该文件管理。
 - **服务端 websearch 主路径靠「provider 声明」，不靠密钥**：2.x 未声明 provider 时 `websearch.query()` 直接返回 `Web search provider is required`。宿主机跑过交互式 opencode，声明会持久化在它自己的状态库（`~/.local/share/opencode/opencode.db` 的 `kv` 表：`websearch:provider = "random"`）；容器是全新 OpenCode home，没有这条记录，所以要在配置里声明。实测：容器内仅声明 `{"websearch":{"provider":"random"}}`、不配任何凭据，即可拿到 `engine=opencode-websearch`（服务端自选后端）；要固定 tavily/exa 等才需要额外提供对应 `*_API_KEY`。
   声明方式两种：`config/opencode.json` 的 `websearch.provider`，或环境变量 `OPENCODE_CONFIG_CONTENT`（镜像已预设前者所需的 `random`，见 §6.1）。与 `OPENCODE_DISABLE_*` 精简变量无关——实测取消全部精简变量仍报错，补上声明立刻可用。

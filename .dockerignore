@@ -19,7 +19,18 @@ docs
 tests
 *.md
 
-# Provider config holds local addresses/keys: mounted read-only from ./config at runtime, never baked into an image layer
+# scripts/ ships because HEALTHCHECK runs docker-healthcheck.mjs inside the container. The Windows build and
+# publish helpers run on the host against the host's Docker daemon, the gateway never reads them, so they stay
+# out of the image (scripts\docker-build.bat, scripts\docker-publish.bat).
+# **/ is not decoration: .dockerignore patterns follow Go's filepath.Match rules (plus Docker's `**` extension),
+# where `*` does not cross `/`, so a bare `*.bat` would match a file at the context root and silently miss
+# scripts/*.bat.
+**/*.bat
+
+# The real provider config is machine-specific and may hold a plaintext apiKey, so it never enters an image
+# layer. The image ships the committed template instead (Dockerfile: COPY config/opencode.json.example
+# ./config/opencode.json) — that is why this exclusion can stay absolute while still "baking opencode.json".
+# A local file overrides it at run time via the read-only ./config mount.
 config/opencode.json
 # Accepted API keys live in the same mounted directory; the template config/.keys.example may be packaged, the real file may not
 config/.keys

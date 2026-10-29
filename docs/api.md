@@ -16,7 +16,7 @@
 | `POST` | `/v1/responses` | OpenAI | Responses API（SSE 流式） |
 | `POST` | `/v1/messages` | Anthropic | Messages API（兼容 Claude SDK，SSE 流式） |
 | `POST` | `/v1/web_search` | 自定义 | **独立 web-search API**（需指定内置模型） |
-| `GET` | `/health` | 自定义 | 健康检查（含 OpenCode 后端连通性） |
+| `GET` | `/health` | 自定义 | 健康检查（含 OpenCode 后端连通性）；后端不可达时 HTTP 仍 `200`、`status="degraded"`，容器 `HEALTHCHECK` 按此判定 |
 | `GET` | `/docs` | 文档 | Swagger UI（实现辅助，非业务契约） |
 | `GET` | `/docs/json` | 文档 | OpenAPI 3.1 JSON（由路由 schema 生成） |
 
@@ -254,7 +254,7 @@ OpenAI Responses API 协议。
 |:---|:-----|
 | 标识形式 | **必须**为 `ollama/<ollama-model-id>`，前缀 `ollama/` 为网关唯一自定义命名空间 |
 | `<ollama-model-id>` | 必须与 `ollama list` 中的真实模型名**完全一致**（如 `qwen3:4b`、`llama3.1:8b`），允许 `:`、`.`、`-` |
-| 声明要求 | 须在 `config/opencode.json`（`provider.ollama.models`）中声明（随镜像打包），未声明者视为未知模型 |
+| 声明要求 | 须在 `config/opencode.json`（`providers.ollama.models`）中声明（镜像烘的是模板 `config/opencode.json.example`），未声明者视为未知模型 |
 | 别名（可选） | config/config.yaml `ollama.aliases` 支持短名映射，如 `qwen→ollama/qwen3:4b`；别名在解析前先展开 |
 | 校验 | 请求 `ollama/<id>` 不在 `config/opencode.json` 已声明模型中 → `400 model_not_found` |
 

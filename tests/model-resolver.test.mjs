@@ -27,12 +27,13 @@ function makeConfig(yaml = "") {
   return configPath;
 }
 
-function makeResolver({ random = () => 0, yaml = "", models = MODELS } = {}) {
-  const config = loadConfig({ CONFIG_PATH: makeConfig(yaml) });
+function makeResolver({ random = () => 0, yaml = "", models = MODELS, env = {} } = {}) {
+  const config = loadConfig({ CONFIG_PATH: makeConfig(yaml), ...env });
   const client = { listModels: async () => models };
-  const logger = { debug() {}, warn() {} };
+  const warnings = [];
+  const logger = { debug() {}, warn: (fields, message) => warnings.push({ fields, message }) };
   const resolver = createModelResolver({ client, config, logger, random });
-  return { resolver };
+  return { resolver, warnings };
 }
 
 test("池过滤：deprecated / alpha / enabled=false / 缺 providerID 均不入池", async () => {
@@ -204,6 +205,40 @@ test("resolveWebSearchModel：web_search.model 显式覆盖优先；失效时回
 test("resolveWebSearchModel：显式 ollama/<id> 仍拒绝", async () => {
   const { resolver } = makeResolver();
   await assert.rejects(() => resolver.resolveWebSearchModel("ollama/qwen3:4b"), (e) => e.code === "invalid_model");
+});
+
+const RENAMED_MODELS = [
+  { providerID: "opencode", modelID: "flint-40b-free", id: "flint-40b-free", status: "active", enabled: true },
+  { providerID: "my-ollama", modelID: "qwen3.5:9b", id: "qwen3.5:9b", status: "active", enabled: true },
+];
+
+test("OLLAMA_LOCAL_PROVIDER 改名：auto 排除与 web-search 默认都跟着新 provider id 走", async () => {
+  const yaml = "models:\n  allow: [\"^my-ollama/\", \"^opencode/\"]\n";
+  const { resolver } = makeResolver({ yaml, models: RENAMED_MODELS, env: { OLLAMA_LOCAL_PROVIDER: "my-ollama" } });
+  assert.equal((await resolver.resolve("auto")).name, "opencode/flint-40b-free");
+  assert.equal((await resolver.resolveWebSearchModel()).name, "my-ollama/qwen3.5:9b");
+});
+
+test("models.allow 没跟着改名：listAllowed 明确告警，而不是静默少一批模型", async () => {
+  // the pool still has ollama-local/*, but the allowlist only keeps opencode/* — the usual "Ollama 掉线" 误判
+  const { resolver, warnings } = makeResolver({
+    models: LOCAL_MODELS,
+    yaml: "models:\n  allow: [\"^opencode/\"]\n",
+  });
+  const { builtins } = await resolver.listAllowed();
+  assert.deepEqual(builtins.map((model) => model.name), ["opencode/flint-40b-free"]);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0].message, /models\.allow matched none of the local provider models/);
+  assert.equal(warnings[0].fields.localProvider, "ollama-local");
+});
+
+test("provider id 校验：保留名 ollama 与非法形式在启动时就拒绝", async () => {
+  const configPath = makeConfig("");
+  assert.throws(() => loadConfig({ CONFIG_PATH: configPath, OLLAMA_LOCAL_PROVIDER: "ollama" }), /不能是 "ollama"/);
+  assert.throws(() => loadConfig({ CONFIG_PATH: configPath, OLLAMA_LOCAL_PROVIDER: "Bad ID" }), /validation failed/);
+  // uppercase is normalised, blank means "unset" (an empty -e value must not break startup)
+  assert.equal(loadConfig({ CONFIG_PATH: configPath, OLLAMA_LOCAL_PROVIDER: " My-Ollama " }).localProvider, "my-ollama");
+  assert.equal(loadConfig({ CONFIG_PATH: configPath, OLLAMA_LOCAL_PROVIDER: "" }).localProvider, "ollama-local");
 });
 
 test("TTL 缓存：60s 内不重复拉取（listModels 只调一次）", async () => {

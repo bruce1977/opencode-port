@@ -13,11 +13,11 @@ const boolish = z.preprocess((value) => {
   return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
 }, z.boolean());
 
-// Compose injects `${VAR:-}` as an empty string: an empty optional must mean "unset", not a validation error
-const optionalText = z.preprocess(
-  (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
-  z.string().trim().min(1).optional(),
-);
+// An environment variable set to "" means "unset" (`-e VAR=`, `--env-file` with a blank value, a blank line in .env):
+// it must fall back to the default instead of failing validation or becoming an empty path.
+const emptyToUndefined = (value) => (typeof value === "string" && value.trim() === "" ? undefined : value);
+
+const optionalText = z.preprocess(emptyToUndefined, z.string().trim().min(1).optional());
 
 const envSchema = z.object({
   PORT: z.coerce.number().int().min(1).max(65535).default(10000),
@@ -30,6 +30,25 @@ const envSchema = z.object({
   API_KEYS_FILE: optionalText.default("./config/.keys"),
   SEARCH_API_KEY: z.string().default(""),
   CONFIG_PATH: z.string().trim().min(1).default("./config/config.yaml"),
+  // Provider id of the custom local provider declared in opencode.json (`providers.<id>`): the gateway keeps it
+  // out of the auto pool and uses its first model as the web-search default (api.md §7), so a rename is a
+  // deployment change, not a code change. "ollama" is rejected: that namespace is OpenCode's own provider and
+  // the model pool split keys on it.
+  OLLAMA_LOCAL_PROVIDER: z.preprocess(
+    emptyToUndefined,
+    z
+      .string()
+      .trim()
+      .transform((value) => value.toLowerCase())
+      .refine((value) => /^[a-z0-9][a-z0-9._-]*$/.test(value), {
+        message:
+          "OLLAMA_LOCAL_PROVIDER 必须是小写 provider id（字母或数字开头，可含 . _ -），且与 opencode.json 里 providers 的键一致",
+      })
+      .refine((value) => value !== "ollama", {
+        message: 'OLLAMA_LOCAL_PROVIDER 不能是 "ollama"（那是 OpenCode 内置 provider 的命名空间，模型分类会乱）',
+      })
+      .default("ollama-local"),
+  ),
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
 });
 
@@ -113,7 +132,7 @@ export function loadDotEnv(path = ".env", env = process.env) {
  * Read the API keys file: one **plaintext** key per line (no encryption, no hashing, no {env:VAR}
  * interpolation — the line is the key), blank lines and `#` comment lines ignored.
  * A missing file yields an empty list (auth then relies on `API_KEY` alone, or refuses everything if none).
- * Lines are trimmed and deduplicated in order; the first key is also used by the self-test as the Bearer token.
+ * Lines are trimmed and deduplicated in order; the first key is also what the Docker health check sends as its Bearer token.
  * @param {string} path
  * @returns {string[]}
  */
@@ -187,13 +206,20 @@ export function loadConfig(env = process.env) {
     serverUrl: raw.OPENCODE_SERVER_URL ?? "",
     serverPassword: raw.OPENCODE_SERVER_PASSWORD,
     apiKeyEnabled: raw.API_KEY_ENABLED,
-    /** First accepted key (the self-test calls our own /health with it); the full set is in `apiKeys` */
+    /** First accepted key (the Docker health check calls our own /health with it); the full set is in `apiKeys` */
     apiKey: apiKeys[0] ?? "",
     apiKeys: Object.freeze(apiKeys),
     apiKeysFile: keysFilePath,
     apiKeysFileFound: existsSync(keysFilePath),
     searchApiKey: raw.SEARCH_API_KEY,
     configPath,
+    /**
+     * Custom local provider id (OLLAMA_LOCAL_PROVIDER) and its model-name prefix.
+     * It must equal the `providers` key in opencode.json; the resolver uses it to keep that provider out of
+     * the auto pool and to pick the web-search default model, so a rename is a config change, not a code change.
+     */
+    localProvider: raw.OLLAMA_LOCAL_PROVIDER,
+    localProviderPrefix: `${raw.OLLAMA_LOCAL_PROVIDER}/`,
     allow: Object.freeze({
       regex: file.models.allow.map((pattern) => new RegExp(pattern, "i")),
       sources: file.models.allow,

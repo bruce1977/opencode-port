@@ -19,7 +19,7 @@
 | `POST /v1/messages` | Anthropic Messages API（SSE） |
 | `POST /v1/web_search` | 独立检索 API，**必须指定内置模型** |
 
-文档索引：`README.md`（用法）→ `docs/design.md`（架构与流程）→ `docs/api.md`（接口契约，唯一事实源）。
+文档索引：`README.md`（用法）→ `docs/design.md`（架构与流程）→ `docs/api.md`（接口契约，唯一事实源）→ `docs/docker-deployment.md`（容器化部署：配置发现顺序、环境变量总表、故障判别）。
 
 ---
 
@@ -42,16 +42,16 @@
 ## 3. 目录与职责
 
 ```
-src/index.mjs        进程入口：加载 .env → 装配配置 → 启动 Fastify → 拉起/复用 opencode serve → 模型清单 → 周期自测
+src/index.mjs        进程入口：加载 .env → 装配配置 → 启动 Fastify → 拉起/复用 opencode serve → 模型清单（健康状态由容器层 HEALTHCHECK 负责，进程内不跑定时器）
 src/startup-report.mjs 启动清单：把可用模型按 provider 输出到终端（只做展示）
-src/core/            机制层：server-manager / opencode-client / model-resolver / health-monitor / session-store
+src/core/            机制层：server-manager / opencode-client / model-resolver / session-store
 src/api/routes/      协议层：health / models / chat / responses / messages / web-search
 src/tools/           检索实现：服务端 websearch 优先 + SearchProvider 兜底
-scripts/             一次性运维与自检脚本（与源码同一套 lint 规则）
+scripts/             一次性运维与自检脚本（与源码同一套 lint 规则）；docker-healthcheck.mjs 是 Docker HEALTHCHECK 的执行体，需随镜像打包；docker-build.bat / docker-publish.bat 在宿主机跑，不进镜像（.dockerignore 排除 `*.bat`）
 tests/               node:test 用例，命名 *.test.mjs
 config/              业务默认值与工具配置（config.yaml 直接入库；opencode.json.example 与 .keys.example 是模板；eslint.config.mjs；
-                     实际 opencode.json 与 .keys 不入库）
-docs/                设计文档与 API 契约
+                     实际 opencode.json 与 .keys 不入库、不进镜像；opencode.json.example 构建期复制成镜像的 /app/config/opencode.json）
+docs/                设计文档与 API 契约（docker-deployment.md 是容器化部署）
 ```
 
 **依赖方向**：`api` / `tools` → `core`。`core` 不得 import `api` 或 `tools`（lint 已强制）。
@@ -106,17 +106,20 @@ docs/                设计文档与 API 契约
 
 | 层 | 载体 | 只放 | 不放 |
 |:---|:-----|:-----|:-----|
-| 版本 | `Dockerfile` 的 `ARG` + `package.json`/lock | `@opencode/cli` 与 `@opencode/client` 版本；非敏感部署项的镜像内默认值（`PORT` / `OPENCODE_SERVER_PORT` / `LOG_LEVEL` / `CONFIG_PATH`，运行期可覆盖） | 任何密钥、业务默认值（`API_KEY_ENABLED` / `API_KEYS_FILE` 即使非敏感也不写进 `ENV`，BuildKit 会按**名字**含 `API_KEY` 报密钥告警） |
-| 部署/敏感 | 环境变量（`.env`，模板 `.env.example`） | 端口、后端地址、`OPENCODE_SERVER_PASSWORD`、`API_KEY`、`API_KEYS_FILE`、`SEARCH_API_KEY`、`CONFIG_PATH`、`LOG_LEVEL`，以及透传给 `opencode serve` 的 provider 密钥（`OLLAMA_API_KEY`、`TAVILY_API_KEY`…） | 业务默认值 |
+| 版本 + 部署默认值 | `Dockerfile` 的 `ARG` / `ENV` + `package.json`/lock | `@opencode/cli` 与 `@opencode/client` 版本；**非敏感部署项的镜像内默认值**（`PORT` / `OPENCODE_SERVER_PORT` / `OPENCODE_SERVER_URL` / `LOG_LEVEL` / `CONFIG_PATH` / `OLLAMA_LOCAL_PROVIDER`，以及开关 `API_KEY_ENABLED=false` 与路径 `API_KEYS_FILE=/app/config/.keys`）；`OPENCODE_SERVER_PASSWORD` 只允许**内部占位值**（保护容器内 `127.0.0.1` 那条链路，文档要求上线前 `-e` 改掉，不得用于 `OPENCODE_SERVER_URL` 指向的远端实例） | **真密钥**（`API_KEY` / `SEARCH_API_KEY` / `OLLAMA_API_KEY` / `TAVILY_API_KEY`…连 `ENV` 声明都不留）、真实 `config/opencode.json`、真实 `config/.keys`、业务默认值 |
+| 部署/敏感 | 环境变量（`.env`，模板 `.env.example`；容器里 `-e` / `--env-file`） | 端口、后端地址、`OPENCODE_SERVER_PASSWORD`、`API_KEY`、`API_KEYS_FILE`、`OLLAMA_LOCAL_PROVIDER`、`SEARCH_API_KEY`、`CONFIG_PATH`、`LOG_LEVEL`，以及透传给 `opencode serve` 的 provider 密钥（`OLLAMA_API_KEY`、`TAVILY_API_KEY`…） | 业务默认值 |
 | 对外凭据清单 | `config/.keys`（模板 `config/.keys.example`，**一行一个 key**；实际文件不入库、不进镜像） | 开启 `API_KEY_ENABLED` 后要接受的 key | 业务默认值、任何注释以外的字段 |
 | 业务默认值 | `config/config.yaml`（直接入库，随镜像打包） | `models.allow`、`models.auto.*`、`models.aliases`、`ollama.aliases`、`web_search.*`、`search.*`、`session.ttl_min` | 任何密钥 |
-| Provider | `config/opencode.json`（模板 `config/opencode.json.example`，实际文件不入库） | `provider.ollama` 的 baseURL 与模型声明、`websearch.provider` 声明 | 业务逻辑、明文密钥（一律写成 `{env:VAR}` 插值） |
+| Provider | `config/opencode.json`（模板 `config/opencode.json.example`，实际文件不入库） | `providers.<id>` 的 baseURL 与模型声明、`websearch.provider` 声明 | 业务逻辑、明文密钥（一律写成 `{env:VAR}` 插值） |
 
 - 密钥默认只走环境变量：**不进 `config/`、不进镜像层、不进日志、不进错误响应**。
   唯一例外是 `config/.keys`：它是**运行期凭据清单**（一行一个对外 API key，**明文存、明文比**——不加解密、不哈希、不做 `{env:VAR}` 插值），
   由 `.gitignore` + `.dockerignore` 双重排除、只通过 `./config` 只读挂载或本机文件提供；模板 `.keys.example` 才入库。
   除该文件外，任何密钥仍一律走环境变量；key 值不得出现在日志、错误响应与镜像层里（与 `OPENCODE_SERVER_PASSWORD` 同级要求）。
-- 新增配置键必须**四处同步**：`config/config.yaml`、代码内默认值、`README.md` 配置表、`docs/design.md` §6。
+- **`config/opencode.json` 是「烘模板、排除真文件」**：镜像在构建期 `COPY config/opencode.json.example ./config/opencode.json`（opencode 2.2.0 只读不写这个文件，镜像不自带就没有自定义模型），
+  而真实文件由 `.dockerignore` 绝对排除。这条排除是「烘 `opencode.json`」安全的前提——**只有 `{env:VAR}` 形态的 provider 配置可以进镜像层**，明文密钥一旦推出收不回来。
+- `ENV` 里 `API_KEY_ENABLED` / `API_KEYS_FILE` 会触发 BuildKit 的 `SecretsUsedInArgOrEnv` 告警（按**名字**判定，值只是开关与路径）。**该告警属于预期**，不要为此把默认值挪回代码或改成 `ARG`。
+- 新增配置键必须**四处同步**：`config/config.yaml`（或 `opencode.json` / 环境变量对应的那一层）、代码内默认值、`README.md` 配置表、`docs/design.md` §6；容器相关的还要同步 `docs/docker-deployment.md` §4 与 `Dockerfile` 的注释。
 
 ---
 

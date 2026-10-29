@@ -6,9 +6,10 @@ logs/
 
 # Actual local config (not committed; the templates config/config.yaml and .env.example are committed)
 .env
-config/opencode.json
+
 # Accepted API keys (one per line); template config/.keys.example is committed, the real file never is
 config/.keys
+config/opencode.json
 
 # OpenCode local data and cache
 .opencode/

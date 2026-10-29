@@ -29,7 +29,7 @@ test("环境变量：boolish 语义（\"false\" 必须是 false，不是 truthy 
   });
 });
 
-test("环境变量：空串视为未设置（compose 的 ${VAR:-} 注入），非空才生效", () => {
+test("环境变量：空串视为未设置（`-e VAR=` 与 .env 空值），非空才生效", () => {
   withConfigFile("", (path) => {
     assert.equal(loadConfig({ CONFIG_PATH: path, OPENCODE_SERVER_URL: "" }).serverUrl, "");
     const external = "http://127.0.0.1:10001";
@@ -128,7 +128,7 @@ test("API keys 文件：一行一个，忽略空行与 # 注释、去重、保�
     assert.deepEqual(readApiKeys(path), ["sk-alice", "sk-bob", "sk-carol"]);
     const config = loadConfig({ CONFIG_PATH: join(dir, "config.yaml"), API_KEYS_FILE: path });
     assert.deepEqual(config.apiKeys, ["sk-alice", "sk-bob", "sk-carol"]);
-    // apiKey 取第一个：每分钟自测用它访问自己的 /health
+    // apiKey is the first entry: the Docker health check calls our own /health with it
     assert.equal(config.apiKey, "sk-alice");
     assert.equal(config.apiKeysFileFound, true);
   } finally {

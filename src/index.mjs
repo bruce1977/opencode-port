@@ -7,7 +7,6 @@ import { createBackendClient } from "./core/opencode-client.mjs";
 import { createModelResolver } from "./core/model-resolver.mjs";
 import { createServerManager } from "./core/server-manager.mjs";
 import { createSessionStore } from "./core/session-store.mjs";
-import { startHealthSelfTest } from "./core/health-monitor.mjs";
 import { writeModelCatalogue } from "./startup-report.mjs";
 import { createAuthHook } from "./api/auth.mjs";
 import { AJV_OPTIONS } from "./api/fastify-options.mjs";
@@ -37,7 +36,7 @@ async function main() {
   if (config.apiKeyEnabled) {
     const fields = { keysFile: config.apiKeysFile, keysFileFound: config.apiKeysFileFound, keyCount: config.apiKeys.length };
     if (config.apiKeys.length === 0) {
-      app.log.error(fields, "API key auth is enabled but no key was loaded, every request will get 401 (put one plaintext key per line in this file, template: config/.keys.example, or set API_KEY)");
+      app.log.error(fields, "API key auth is enabled but no key was loaded, every request will get 401 (put one plaintext key per line in this file — template: config/.keys.example in the repository — or set API_KEY)");
     } else if (!config.apiKeysFileFound) {
       app.log.warn(fields, "API keys file not found, accepting the API_KEY environment variable only");
     } else {
@@ -100,34 +99,37 @@ async function main() {
   registerWebSearchRoutes(app, { ctx });
 
   await app.listen({ port: config.port, host: "0.0.0.0" });
-  app.log.info({ port: config.port, server: serverUrl, docs: "/docs" }, "gateway started");
+  // localProvider is logged because a mismatch with opencode.json / models.allow is the usual reason
+  // the custom models are missing from /v1/models
+  app.log.info(
+    { port: config.port, server: serverUrl, docs: "/docs", localProvider: config.localProvider },
+    "gateway started",
+  );
 
   // Fetch the full model catalogue (built-in + custom providers) once after startup and print it to the terminal.
   // Failure does not block startup: /health reports degraded and later requests can still retry.
   try {
     const catalogue = await resolver.listAll();
     writeModelCatalogue(process.stdout, catalogue);
+    // A renamed OLLAMA_LOCAL_PROVIDER that no declared model matches is otherwise invisible: the gateway looks
+    // healthy, /v1/models just stops listing the custom models.
+    if (!catalogue.builtins.some((model) => model.name.toLowerCase().startsWith(config.localProviderPrefix))) {
+      app.log.warn(
+        { localProvider: config.localProvider, builtins: catalogue.builtins.length },
+        `no model uses the local provider prefix (check the providers key in opencode.json and OLLAMA_LOCAL_PROVIDER)`,
+      );
+    }
   } catch (error) {
     app.log.warn({ err: error }, "failed to list available models (gateway keeps starting)");
   }
 
-  // Periodic self-test: call our own /health (including backend connectivity) every 60s
-  const selfTest = startHealthSelfTest({
-    url: `http://127.0.0.1:${config.port}/health`,
-    intervalMs: 60 * 1000,
-    apiKey: config.apiKeyEnabled ? config.apiKey : "",
-    logger: app.log,
-  });
-  app.log.info({ intervalSec: 60, url: `http://127.0.0.1:${config.port}/health` }, "self-test timer started");
-
-  // Graceful shutdown: stop the self-test and the gateway first, then opencode serve (design.md §4.1)
+  // Graceful shutdown: close the gateway first, then opencode serve (design.md §4.1)
   let closing = false;
   const shutdown = async (signal) => {
     if (closing) return;
     closing = true;
     app.log.info({ signal }, "shutdown signal received, starting graceful shutdown");
     try {
-      selfTest.stop();
       await app.close();
       await serverManager.stopServe();
     } catch (error) {

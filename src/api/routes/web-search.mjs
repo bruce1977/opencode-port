@@ -50,7 +50,7 @@ export function registerWebSearchRoutes(app, { ctx }) {
       tags: ["web-search"],
       summary: "独立 web-search",
       description:
-        "输入关键词返回网页段落文字（api.md §8）。model 可省略或使用别名；缺省时依次取 web_search.model、首个 ollama-local/*、models.auto.fallback。仅 synthesize=true 时驱动答案综合。",
+        "输入关键词返回网页段落文字（api.md §8）。model 可省略或使用别名；缺省时依次取 web_search.model、本地 provider（OLLAMA_LOCAL_PROVIDER，默认 ollama-local）的首个模型、models.auto.fallback。仅 synthesize=true 时驱动答案综合。",
       body: toJsonSchema(bodySchema),
       response: { 200: responseSchema },
     },
