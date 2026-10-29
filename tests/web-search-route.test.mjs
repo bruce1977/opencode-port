@@ -1,4 +1,4 @@
-// POST /v1/web_search route-level simulation: only query is required; model supports aliases and the default chain (api.md §8.2).
+// POST /v1/web-search route-level simulation: only query is required; model supports aliases and the default chain (api.md §8.2).
 import test from "node:test";
 import assert from "node:assert/strict";
 import Fastify from "fastify";
@@ -73,7 +73,7 @@ test("仅传 query：model 默认走 ollama-local，其余参数取默认值", a
   await withApp(async (app) => {
     const response = await app.inject({
       method: "POST",
-      url: "/v1/web_search",
+      url: "/v1/web-search",
       payload: { query: "OpenCode 网关" },
     });
     assert.equal(response.statusCode, 200);
@@ -92,7 +92,7 @@ test("model 支持别名（大小写不敏感）", async () => {
   await withApp(async (app) => {
     const response = await app.inject({
       method: "POST",
-      url: "/v1/web_search",
+      url: "/v1/web-search",
       payload: { query: "别名", model: "QWEN3.5" },
     });
     assert.equal(response.statusCode, 200);
@@ -104,7 +104,7 @@ test("缺少 query → 400 invalid_request", async () => {
   await withApp(async (app) => {
     const response = await app.inject({
       method: "POST",
-      url: "/v1/web_search",
+      url: "/v1/web-search",
       payload: { model: "qwen3.5" },
     });
     assert.equal(response.statusCode, 400);
@@ -116,7 +116,7 @@ test("空白 query → 400 invalid_request", async () => {
   await withApp(async (app) => {
     const response = await app.inject({
       method: "POST",
-      url: "/v1/web_search",
+      url: "/v1/web-search",
       payload: { query: "   " },
     });
     assert.equal(response.statusCode, 400);
@@ -128,7 +128,7 @@ test("显式未知 model → 400 model_not_found", async () => {
   await withApp(async (app) => {
     const response = await app.inject({
       method: "POST",
-      url: "/v1/web_search",
+      url: "/v1/web-search",
       payload: { query: "未知模型", model: "nope" },
     });
     assert.equal(response.statusCode, 400);

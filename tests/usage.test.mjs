@@ -43,7 +43,7 @@ test("logUsage: maps OpenCode tokens to a structured usage log line", async () =
 test("logUsage: missing tokens/cost fall back to zeros", async () => {
   const logger = captureLogger();
   logUsage(logger, {
-    endpoint: "/v1/web_search",
+    endpoint: "/v1/web-search",
     model: "ollama-local/qwen3.5:9b",
     startedAt: Date.now(),
     result: {},

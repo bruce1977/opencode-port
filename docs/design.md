@@ -32,7 +32,7 @@ OpenCode 内置了若干**免费模型**（`opencode/*-free` 系列，免登录�
 | 维度 | OpenCode2API（原） | 本项目（衍生） |
 |:-----|:-------------------|:---------------|
 | 模型选择 | 模型别名解析（如 `gpt5-nano → gpt-5-nano`）、allowlist | **新增 `auto` 白名单随机模式** + 国内可用性过滤 |
-| 外部工具 | `web_fetch`（按 URL 抓取）、工具桥接 | **独立 `web_search` API**（关键词 → 段落文字，`model` 可省略/别名） |
+| 外部工具 | `web_fetch`（按 URL 抓取）、工具桥接 | **独立 `web-search` API**（关键词 → 段落文字，`model` 可省略/别名） |
 | Ollama | 依赖 OpenCode 自身 provider 配置 | **显式配置项**声明 Ollama 自定义模型并对外暴露 |
 | 鉴权 | `API_KEY` / 多用户 key | 同样支持，定位为**可选开关**；多 key 从 `config/.keys` 读取（一行一个），只做凭据分发与吊销，无配额/计费语义 |
 | 端点 | chat/responses/messages + 面板/指标 | 聚焦 chat/responses，面板/指标作为可选扩展 |
@@ -177,11 +177,11 @@ sequenceDiagram
 
 ### 4.4 Ollama 自定义模型接入
 
-- **配置位置**：本地推理写成 OpenCode 的自定义 provider——`config/opencode.json` 的 `providers.<id>`（2.x：`package: "@opencode/ai/providers/openai-compatible"` + `settings.baseURL` / `settings.apiKey`（`{env:...}` 插值）+ `models`），并 `plugins: ["-opencode.provider.ollama"]` 关掉内置 `ollama`；随镜像打包（烘的是模板，§6.5）；**不再通过环境变量**（`OLLAMA_BASE_URL` / `OLLAMA_MODELS` 移除）。
-- **provider id 可配置**：`OLLAMA_LOCAL_PROVIDER`（默认 `ollama-local`）决定「哪些模型不进 `auto` 池」与 `web_search` 缺省取哪款本地模型；它必须与 `providers` 的键、`config.yaml` 的 `models.allow` 三处一致（§6.2、`docker-deployment.md` §3）。
+- **配置位置**：本地推理写成 OpenCode 的自定义 provider——`config/opencode.json` 的 `providers.<id>`（2.x：`package: "@opencode/ai/providers/openai-compatible"` + `settings.baseURL` / `settings.apiKey`（`{env:...}` 插值）+ `models`），并 `plugins: ["-opencode.provider.ollama"]` 关掉内置 `ollama`；随镜像打包（烘的是模板，其 `models` **默认为空**——默认部署不预置任何模型，§6.5）；**不再通过环境变量**（`OLLAMA_BASE_URL` / `OLLAMA_MODELS` 移除）。
+- **provider id 可配置**：`OLLAMA_LOCAL_PROVIDER`（默认 `ollama-local`）决定「哪些模型不进 `auto` 池」与 `web-search` 缺省取哪款本地模型；它必须与 `providers` 的键、`config.yaml` 的 `models.allow` 三处一致（§6.2、`docker-deployment.md` §3）。
 - 模型全称对外暴露为 `<id>/<model>`（如 `ollama-local/qwen3.5:9b`）；网关经 `model.list()` 读取已声明的模型，用于校验与 `/v1/models` 展示。
-- **命名规则**：`ollama/<ollama-model-id>` 那条路径属于 OpenCode **内置** provider（被上面 `plugins` 关掉后，需自行在 `providers.ollama.models` 声明才有模型）；`<id>` 必须与 `ollama list` 一致。可选 `config/config.yaml` 的 `ollama.aliases` 短名映射。完整规则见 api.md §7.3。
-- 客户端请求 `model: "ollama/qwen3:4b"` 即可走本地推理，零成本、可离线。
+- **命名规则**：默认路径是 `<providers键>/<模型id>`（如 `ollama-local/qwen3.5:9b`），须在 `providers.<键>.models` 声明并命中 `models.allow`；`ollama/<id>` 那条路径属于 OpenCode **内置** provider 保留名（被上面 `plugins` 关掉后，需自行在 `providers.ollama.models` 声明才有模型）。可选 `config/config.yaml` 的 `ollama.aliases` 短名映射（如 `qwen3.5→ollama-local/qwen3.5:9b`）。完整规则见 api.md §7.3。
+- 客户端请求 `model: "ollama-local/<已声明的模型>"` 即可走本地推理，零成本、可离线。
 - 注意：Ollama 工具调用需要足够 `num_ctx`，建议在 Ollama 侧适当调大（16k–32k）。
 
 ### 4.5 web-search 独立 API
@@ -190,7 +190,7 @@ sequenceDiagram
 
 ```mermaid
 flowchart LR
-    A[POST /v1/web_search<br/>model(内置) + query] --> B[服务端 websearch<br/>websearch.query]
+    A[POST /v1/web-search<br/>model(可省略) + query] --> B[服务端 websearch<br/>websearch.query]
     B --> C[服务端已配置后端<br/>exa/tavily/...]
     C --> D[结果 URL + 摘要]
     D --> E[抓取原页 + 段落抽取 + 截断]
@@ -296,7 +296,7 @@ flowchart LR
 | `API_KEY_ENABLED` | `false` | `false` | 是否开启对外 API KEY 鉴权 |
 | `API_KEY` | 空 | **不存在** | 单个 key，追加进 `config/.keys` 的集合并排在最前 |
 | `API_KEYS_FILE` | `./config/.keys` | `/app/config/.keys` | **对外 key 清单文件，一行一个**（空行/`#` 注释忽略、去重）。文件缺失只意味着「没有 key」，不报错；读不了（权限等）则启动失败。**别把宿主机路径传进容器**（§6.1） |
-| `OLLAMA_LOCAL_PROVIDER` | `ollama-local` | `ollama-local` | 自定义本地 provider 的 id：决定哪些模型不进 `auto` 池、`web_search` 缺省取哪款本地模型。转小写、不能是保留名 `ollama`，且必须等于 `opencode.json` 里 `providers` 的键与 `models.allow` 里的写法（三处一致，`docker-deployment.md` §3） |
+| `OLLAMA_LOCAL_PROVIDER` | `ollama-local` | `ollama-local` | 自定义本地 provider 的 id：决定哪些模型不进 `auto` 池、`web-search` 缺省取哪款本地模型。转小写、不能是保留名 `ollama`，且必须等于 `opencode.json` 里 `providers` 的键与 `models.allow` 里的写法（三处一致，`docker-deployment.md` §3） |
 | `SEARCH_API_KEY` | 空 | **不存在** | 仅使用付费搜索后端时需要；默认免费后端无需 |
 | `OLLAMA_API_KEY` | — | **不存在** | 网关不读，仅透传给 `opencode serve`：`config/opencode.json` 里 `{env:OLLAMA_API_KEY}` 插值用。不设置时插值成空串，provider 照样注册（实测） |
 | `TAVILY_API_KEY` | — | **不存在** | 网关不读，仅透传给 `opencode serve`：固定某个检索后端时才需要（默认 `random` 免密钥） |
@@ -333,7 +333,7 @@ flowchart LR
 
 ### 6.4 推理用量日志
 
-每次推理成功（`chat` / `responses` / `messages` 的流式与非流式、`web_search` 的 `synthesize`）由 `src/core/usage.mjs` 记一条 `event=usage` 的结构化 info 日志：
+每次推理成功（`chat` / `responses` / `messages` 的流式与非流式、`web-search` 的 `synthesize`）由 `src/core/usage.mjs` 记一条 `event=usage` 的结构化 info 日志：
 `endpoint`、`model`、`stream`、`prompt_tokens`（`tokens.input + tokens.cache.read`）、`completion_tokens`、`reasoning_tokens`、`cache_read`、`cache_write`、`cost`、`duration_ms`。
 不新增存储依赖；失败请求不记用量，走常规 error 日志。
 
@@ -365,12 +365,12 @@ flowchart LR
 | `POST` | `/v1/chat/completions` | OpenAI | Chat Completions（SSE 流式） |
 | `POST` | `/v1/responses` | OpenAI | Responses API（SSE 流式） |
 | `POST` | `/v1/messages` | Anthropic | Messages API（兼容 Claude SDK，SSE 流式） |
-| `POST` | `/v1/web_search` | 自定义 | **独立 web-search API**（`model` 可省略/别名） |
+| `POST` | `/v1/web-search` | 自定义 | **独立 web-search API**（`model` 可省略/别名） |
 | `GET` | `/docs` | 文档 | Swagger UI（交互式文档，实现辅助） |
 | `GET` | `/docs/json` | 文档 | OpenAPI 3.1 JSON（由路由 schema 生成） |
 
 - 推理三端点（`chat` / `responses` / `messages`）均支持 `model: "auto"`、`<provider>/<id>` 内置模型、以及 `ollama/<id>`。
-- **`web_search` 是独立 API**，不内嵌为工具；仅 `query` 必填，`model` 可省略（`web_search.model` → 首个 `ollama-local/*` → `models.auto.fallback`）或使用别名；显式指定时拒绝 `auto` / `ollama/<id>`。
+- **`web-search` 是独立 API**，不内嵌为工具；仅 `query` 必填，`model` 可省略（`web_search.model` → 首个 `ollama-local/*` → `models.auto.fallback`）或使用别名；显式指定时拒绝 `auto` / `ollama/<id>`。
 - 模型命名与解析规则见 [api.md §7](./api.md)；端点细节见 [api.md §8](./api.md)。
 - 错误统一格式：`{ "error": { "message", "type", "code" } }`，常见 `401/400/502/503` 见 api.md §2.4。
 

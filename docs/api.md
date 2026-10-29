@@ -10,19 +10,19 @@
 
 | 方法 | 路径 | 协议族 | 说明 |
 |:-----|:-----|:-------|:-----|
-| `GET` | `/v1/models` | OpenAI | 模型列表（含虚拟模型 `auto` 与 Ollama 声明） |
+| `GET` | `/v1/models` | OpenAI | 模型列表（含虚拟模型 `auto` 与已声明的 provider 模型） |
 | `GET` | `/v1/aliases` | 自定义 | 模型别名列表（`models.aliases` / `ollama.aliases`） |
 | `POST` | `/v1/chat/completions` | OpenAI | Chat Completions（SSE 流式） |
 | `POST` | `/v1/responses` | OpenAI | Responses API（SSE 流式） |
 | `POST` | `/v1/messages` | Anthropic | Messages API（兼容 Claude SDK，SSE 流式） |
-| `POST` | `/v1/web_search` | 自定义 | **独立 web-search API**（需指定内置模型） |
+| `POST` | `/v1/web-search` | 自定义 | **独立 web-search API**（仅 `query` 必填；`model` 可省略） |
 | `GET` | `/health` | 自定义 | 健康检查（含 OpenCode 后端连通性）；后端不可达时 HTTP 仍 `200`、`status="degraded"`，容器 `HEALTHCHECK` 按此判定 |
 | `GET` | `/docs` | 文档 | Swagger UI（实现辅助，非业务契约） |
 | `GET` | `/docs/json` | 文档 | OpenAPI 3.1 JSON（由路由 schema 生成） |
 
 > `/docs` 与 `/docs/json` 不属于业务 API 契约：开启 `API_KEY` 时仍然公开（浏览器无法为 UI 附加 Authorization），仅暴露接口结构、不含密钥；字段与错误码仍以本文件为准。
 
-> **设计原则**：三个推理端点聚焦**纯文本推理**。`web-search` 是**独立 API**，不内嵌为工具、不追求工具调用的通用性——它直接对外暴露 OpenCode 的内置 web-search 能力，并**必须指定一款内置模型**来驱动。
+> **设计原则**：三个推理端点聚焦**纯文本推理**。`web-search` 是**独立 API**，不内嵌为工具、不追求工具调用的通用性——它直接对外暴露 OpenCode 的内置 web-search 能力，**仅 `query` 必填**；`model` 可省略（缺省链见 §8.2），仅在 `synthesize=true` 时用解析到的模型驱动答案综合。
 
 ---
 
@@ -34,7 +34,7 @@
 - **鉴权**（可开关，`API_KEY_ENABLED`）：
   - OpenAI 系端点：`Authorization: Bearer <key>`。
   - Anthropic `/v1/messages`：支持 `x-api-key: <key>`（或 `Authorization: Bearer`）。
-  - 自定义 `/v1/web_search`：`Authorization: Bearer <key>`。
+  - 自定义 `/v1/web-search`：`Authorization: Bearer <key>`。
   - 未开启时无需携带；开启后缺失/错误返回 `401`。鉴权发生在**请求体校验之前**，所以未鉴权的请求不会拿到 `400` 的 schema 提示。
   - 例外：`/docs` 与 `/docs/json` 始终公开（Swagger UI 无法在浏览器中附加 Authorization）。
 - **key 的来源**：默认读取 `config/.keys`（模板 `config/.keys.example`，路径由 `API_KEYS_FILE` 覆盖），**一行一个**，空行与 `#` 开头的行忽略、自动去重；文件里是**明文 key，原样比对**（不加解密、不哈希、不做 `{env:VAR}` 插值）。环境变量 `API_KEY` 追加进同一集合且排在最前。多 key 只是「任意一条匹配即放行」的凭据集合，用于分发给不同调用方与吊销，不含配额、计费或路由语义。开启鉴权但一条 key 都没加载到（文件没找到且 `API_KEY` 为空）时，所有业务请求都会 `401`，启动日志按状态给 `error` / `warn`（只含路径与条数）。
@@ -48,7 +48,8 @@
 |:-----|:-----|
 | `"auto"` | 网关按 config/config.yaml `models.allow` 从**内置模型池**随机选一款（见 design.md §4.3） |
 | `<provider>/<model>` | 内置/提供商模型，直接透传给 OpenCode（如 `opencode/flint-40b-free`） |
-| `"ollama/<id>"` | 本地 Ollama 自定义模型，需先在 `config/opencode.json` 声明（如 `ollama/qwen3:4b`） |
+| `"ollama-local/<id>"` | 自定义本地 provider 模型（默认键 `ollama-local`），需先在 `config/opencode.json` 的 `providers.<键>.models` 声明——模板 `models` 默认为空，默认部署不预置 |
+| `"ollama/<id>"` | **保留名**命名空间（OpenCode 内置 `ollama` provider）；仅当 `providers.ollama.models` 显式声明后可用 |
 
 > 完整命名与解析规则见 **§7 模型命名规则**。
 
@@ -74,7 +75,7 @@
 | 502 | `upstream_error` | `opencode_unavailable` | OpenCode 后端不可达 |
 | 503 | `service_unavailable` | `no_available_model` | auto 池为空且无兜底 |
 
-> 模型侧错误统一归一化：OpenCode 返回 `provider.free-limit`（免费模型额度耗尽）或 429 限流时映射为 **429 `quota_exceeded`**；其余模型错误映射为 **502 `opencode_unavailable`**。两种情况下检索类接口（`/v1/web_search` 默认 `synthesize=false`）不受影响，可改用 `ollama-local/*` 继续推理。
+> 模型侧错误统一归一化：OpenCode 返回 `provider.free-limit`（免费模型额度耗尽）或 429 限流时映射为 **429 `quota_exceeded`**；其余模型错误映射为 **502 `opencode_unavailable`**。两种情况下检索类接口（`/v1/web-search` 默认 `synthesize=false`）不受影响，可改用 `ollama-local/*` 继续推理。
 
 ---
 
@@ -92,7 +93,7 @@
   "data": [
     { "id": "auto", "object": "model", "created": 1700000000, "owned_by": "gateway", "description": "白名单内内置模型随机" },
     { "id": "opencode/flint-40b-free", "object": "model", "created": 1700000000, "owned_by": "opencode" },
-    { "id": "ollama/qwen3:4b", "object": "model", "created": 1700000000, "owned_by": "ollama" }
+    { "id": "ollama-local/qwen3.5:9b", "object": "model", "created": 1700000000, "owned_by": "ollama-local" }
   ]
 }
 ```
@@ -106,7 +107,7 @@
 
 ## 4. POST /v1/chat/completions
 
-OpenAI Chat Completions 协议，完整 SSE 流式。**纯文本推理，不含 web_search 工具。**
+OpenAI Chat Completions 协议，完整 SSE 流式。**纯文本推理，不含 web-search 工具。**
 
 ### 请求体（关键字段）
 ```json
@@ -192,7 +193,7 @@ OpenAI Responses API 协议。
 
 ## 6. POST /v1/messages（Anthropic Messages API）
 
-兼容 Claude SDK 的 Anthropic 协议。**纯文本推理，不含 web_search 工具。**
+兼容 Claude SDK 的 Anthropic 协议。**纯文本推理，不含 web-search 工具。**
 
 ### 请求体
 ```json
@@ -221,11 +222,11 @@ OpenAI Responses API 协议。
 ### 流式（SSE）
 按 Anthropic 事件序：`message_start` → `content_block_start` → `content_block_delta`（`text_delta`） → `content_block_stop` → `message_delta`（含 `stop_reason`） → `message_stop`。
 
-> 说明：本端点聚焦文本对话。`web_search` 通过独立 API（§8）提供，不以 `tool_use` 形式内嵌；若后续需要客户端自定义函数工具，可作为独立扩展，不影响 web-search 的独立性。
+> 说明：本端点聚焦文本对话。`web-search` 通过独立 API（§8）提供，不以 `tool_use` 形式内嵌；若后续需要客户端自定义函数工具，可作为独立扩展，不影响 web-search 的独立性。
 
 ---
 
-## 7. 模型命名规则（内置 + 自定义 Ollama）
+## 7. 模型命名规则（内置 + 自定义 provider）
 
 所有端点的 `model` 字段遵循统一命名与解析规则。
 
@@ -235,7 +236,7 @@ OpenAI Responses API 协议。
 <namespace>/<model-id>        或  auto（虚拟模型）
 ```
 
-- **保留字**：`auto`（虚拟）、`ollama/`（自定义本地命名空间）、`opencode/`（内置免费模型 `*-free` 系列，如 `opencode/flint-40b-free`）。
+- **保留字**：`auto`（虚拟）、`opencode/`（内置免费模型 `*-free` 系列，如 `opencode/flint-40b-free`）、`ollama/`（**保留名命名空间**——OpenCode 内置 `ollama` provider，`OLLAMA_LOCAL_PROVIDER` 不能占用）。
 - 大小写不敏感；解析前统一 `toLowerCase()`（模型 ID 本身按 OpenCode 返回原样匹配）。
 
 ### 7.2 内置模型（Built-in）
@@ -248,22 +249,26 @@ OpenAI Responses API 协议。
 | 合法性 | 必须在 OpenCode 当前可用模型集中存在，否则 `400 model_not_found`；`enabled=false` 与 `deprecated`/`alpha` 模型视为不可用 |
 | `auto` 池来源 | **仅内置模型**参与 config/config.yaml `models.allow` 匹配（不含 Ollama 自定义，避免随机命中本地模型） |
 
-### 7.3 自定义 Ollama 模型（Custom Ollama）
+### 7.3 自定义本地 provider 模型（Custom Local Provider）
+
+自定义 provider 走**通用路径**：全名 `<providers键>/<模型id>`（默认键 `ollama-local`，即 `ollama-local/<id>`），对应 §7.4 第 5 步「含 `/<model-id>`」的透传情形。
 
 | 项 | 规则 |
 |:---|:-----|
-| 标识形式 | **必须**为 `ollama/<ollama-model-id>`，前缀 `ollama/` 为网关唯一自定义命名空间 |
-| `<ollama-model-id>` | 必须与 `ollama list` 中的真实模型名**完全一致**（如 `qwen3:4b`、`llama3.1:8b`），允许 `:`、`.`、`-` |
-| 声明要求 | 须在 `config/opencode.json`（`providers.ollama.models`）中声明（镜像烘的是模板 `config/opencode.json.example`），未声明者视为未知模型 |
-| 别名（可选） | config/config.yaml `ollama.aliases` 支持短名映射，如 `qwen→ollama/qwen3:4b`；别名在解析前先展开 |
-| 校验 | 请求 `ollama/<id>` 不在 `config/opencode.json` 已声明模型中 → `400 model_not_found` |
+| 标识形式 | `<providers键>/<模型id>`；键必须与 `config/opencode.json` 里 `providers` 的**键**一致，且与 `OLLAMA_LOCAL_PROVIDER` 同步（默认 `ollama-local`） |
+| `<模型id>` | 必须与端点上的真实模型名**完全一致**（如 `qwen3.5:9b`；允许 `:`、`.`、`-`）——模型清单来自声明、不来自探活 |
+| 声明要求 | 须在 `config/opencode.json` 的 `providers.<键>.models` 中声明：**镜像模板 `models` 默认为空、默认部署不预置任何模型**，要哪些自己声明并挂载（`docker-deployment.md` §5.1）；同时命中 config/config.yaml `models.allow` 才会出现在 `/v1/models` |
+| 别名（可选） | config/config.yaml `ollama.aliases` 支持短名映射，如 `qwen3.5→ollama-local/qwen3.5:9b`；别名在解析前先展开 |
+| 校验 | 全名不在 OpenCode 当前可用模型集 → `400 model_not_found` |
+
+`ollama/<id>` 是**保留名**：属于 OpenCode 内置 `ollama` provider 的命名空间（因此自定义 provider 不能占这个键名），仅当 `providers.ollama.models` 显式声明后才可用；未声明时请求它 → `400 model_not_found`。
 
 ### 7.4 解析优先级（`resolveModel`）
 
 1. `auto` → 走 auto 池（§7.2），随机取一款内置模型。
-2. 命中 config/config.yaml `ollama.aliases` → 展开为 `ollama/<id>`，继续第 4 步校验。
+2. 命中 config/config.yaml `ollama.aliases` → 展开为别名目标全名（如 `ollama-local/<id>`），继续第 5 步校验。
 3. 命中内置别名表（可选）→ 展开为内置模型 ID。
-4. 以 `ollama/` 开头 → Ollama 自定义（校验 §7.3）。
+4. 以 `ollama/` 开头 → 保留名命名空间（校验条件见 §7.3 末段）。
 5. 含 `/<model-id>` → 内置/提供商模型透传（校验存在性）。
 6. 裸名（无 `/`）→ 尝试内置别名表；未命中则 `400 model_not_found`。
 
@@ -274,12 +279,12 @@ OpenAI Responses API 协议。
 ```
 
 - `auto` 单独匹配；
-- `ollama/qwen3:4b`、`opencode/flint-40b-free` 均匹配；
+- `ollama-local/qwen3.5:9b`、`opencode/flint-40b-free` 均匹配；
 - 拒绝空串、含空格、含 `/` 但段为空的非法形式。
 
 ---
 
-## 8. POST /v1/web_search（独立 web-search API）
+## 8. POST /v1/web-search（独立 web-search API）
 
 ### 8.1 定位
 
@@ -369,7 +374,7 @@ sequenceDiagram
     participant W as 服务端 websearch 后端
     participant M as 内置模型（仅 synthesize）
 
-    C->>G: POST /v1/web_search {model, query, top_k}
+    C->>G: POST /v1/web-search {model, query, top_k}
     G->>G: 校验 model 为内置模型
     G->>S: POST /api/websearch {query}
     S->>W: 服务端自选已配置后端（exa/tavily/...）
@@ -391,7 +396,7 @@ sequenceDiagram
   - **OpenCode 自身状态**：交互式跑过一次 opencode，设置会落进它的数据库（本机 `~/.local/share/opencode/opencode.db` 的 `kv` 表里就有 `websearch:provider = "random"`），所以宿主机不写任何配置也能用。
   - **配置声明**：`opencode.json` 里的 `websearch.provider`，或环境变量 `OPENCODE_CONFIG_CONTENT`（镜像已预设为 `{"websearch":{"provider":"random"}}`）。
   容器是全新的 OpenCode home，没有那条状态记录，因此必须由配置声明补上——这是容器与本机表现不同的唯一原因，与精简变量、挂载方式无关（实测把 `OPENCODE_DISABLE_*` 全部取消仍然报错，加上声明立刻可用）。
-- **`random` 免密钥可用**：实测容器内仅声明 `{"websearch":{"provider":"random"}}`、不配任何凭据，`/v1/web_search` 即返回 `engine=opencode-websearch`（服务端自选到 tinyfish，9 条结果）。要固定某个后端才需要写 `provider: "tavily"` 之类并提供其 `*_API_KEY`（此时错误会从 `provider is required` 变成 `Web search request failed: <provider>`，即只差密钥）。
+- **`random` 免密钥可用**：实测容器内仅声明 `{"websearch":{"provider":"random"}}`、不配任何凭据，`/v1/web-search` 即返回 `engine=opencode-websearch`（服务端自选到 tinyfish，9 条结果）。要固定某个后端才需要写 `provider: "tavily"` 之类并提供其 `*_API_KEY`（此时错误会从 `provider is required` 变成 `Web search request failed: <provider>`，即只差密钥）。
 - 未声明也未兜底前，容器会先记一条 `Server-side websearch failed, falling back…` 的 warn 再走兜底后端，这是预期行为，不是故障。
 - 不引入工具调用协议：客户端只按 §8 的请求/响应格式使用。
 

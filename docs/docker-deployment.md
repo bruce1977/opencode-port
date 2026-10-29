@@ -59,7 +59,7 @@
 
 ### 2.4 烘进镜像的默认值长什么样，什么时候会被顶掉
 
-镜像里那份 `/app/config/opencode.json` 就是仓库里的 `config/opencode.json.example`：provider id `ollama-local`、`baseURL` 指向 `http://host.docker.internal:11434/v1`、`apiKey` 写成 `{env:OLLAMA_API_KEY}`、声明 `qwen3.5:9b` 与 `qwen3.6:35b` 两个模型。**真实那份 `config/opencode.json` 永远不进镜像**：`.dockerignore` 把它整条排除，`COPY` 只取模板——因为本机文件里可能写着明文 `apiKey`，而镜像层推出去就收不回来（`AGENTS.md` §5）。
+镜像里那份 `/app/config/opencode.json` 就是仓库里的 `config/opencode.json.example`：provider id `ollama-local`、`baseURL` 指向 `http://host.docker.internal:11434/v1`、`apiKey` 写成 `{env:OLLAMA_API_KEY}`；`models` 默认**为空**——**默认部署不预置任何 Ollama 模型**，要哪些模型由你在按 §5.1 挂载的文件里自己声明（并同步 `config.yaml` 的 `models.allow`，§3）。**真实那份 `config/opencode.json` 永远不进镜像**：`.dockerignore` 把它整条排除，`COPY` 只取模板——因为本机文件里可能写着明文 `apiKey`，而镜像层推出去就收不回来（`AGENTS.md` §5）。
 
 顶掉它的两种方式：
 
@@ -68,19 +68,19 @@
 | `-v ./config:/app/config:ro` | **整目录替换**：容器看到的 `/app/config` 就是宿主那个目录 | 宿主目录里没有 `opencode.json`，烘进镜像的那份就**一起消失**（不是叠加）。这是最常见的「明明挂了卷却没有自定义模型」 |
 | `-v ./config/opencode.json:/app/config/opencode.json:ro` | 只顶掉 provider 配置，`config.yaml` / `.keys` 继续用镜像里那份 | 想「只改一个文件」时用这种，代价是挂载项变多 |
 
-**自定义 provider 端点不存在也不影响部署本身**（**实测**：`baseURL` 写成 `http://unreachable.invalid:11434/v1`、`OLLAMA_API_KEY` 不设置，provider 照样注册、模型照样出现在 `/v1/models`）。模型清单来自声明、不来自探活；真正打过去才失败，表现为推理 `502`，而 `/health` 仍是 `ok`（它探的是容器内的 `opencode serve`，不是 Ollama）。
+**自定义 provider 端点不存在也不影响部署本身**（**实测**：`baseURL` 写成 `http://unreachable.invalid:11434/v1`、`OLLAMA_API_KEY` 不设置，provider 照样注册、**已声明的**模型照样出现在 `/v1/models`）。模型清单来自声明、不来自探活（**实测**：`models` 为空时 `/v1/models` 没有该 provider 的条目，不会自动发现端点上的模型）；真正打过去才失败，表现为推理 `502`，而 `/health` 仍是 `ok`（它探的是容器内的 `opencode serve`，不是 Ollama）。
 
 ---
 
 ## 3. 一个名字，三处一致（改 provider id 的检查表）
 
-默认 id 是 `ollama-local`。网关用它做两件事：把这些模型排除出 `auto` 池、以及 `web_search` 缺省时挑首个本地模型（`api.md` §7.2、§8.2）。改名时**三处必须一致**，少一处就出现「网关健康但模型不见了」：
+默认 id 是 `ollama-local`。网关用它做两件事：把这些模型排除出 `auto` 池、以及 `web-search` 缺省时挑首个本地模型（`api.md` §7.2、§8.2）。改名时**三处必须一致**，少一处就出现「网关健康但模型不见了」：
 
 | # | 位置 | 写什么 |
 |:--|:-----|:-------|
 | 1 | `config/opencode.json` | `providers.<id>` 的**键**（以及该对象的 `name`） |
 | 2 | 环境变量 | `OLLAMA_LOCAL_PROVIDER=<id>`（默认 `ollama-local`；值会转小写，**不能是 `ollama`**——那是 OpenCode 内置 provider 的命名空间，给了就在启动时直接报错） |
-| 3 | `config/config.yaml` | `models.allow` 正则里的 `ollama-local(?:/.*)?`，以及 `ollama.aliases` 的值 `ollama-local/<模型>` |
+| 3 | `config/config.yaml` | `models.allow` 里 `^ollama-local/<模型>$` 这类显式条目（**逐个列出，不用 `ollama-local/.*` 通配**，否则本地全部缓存模型都会被列出来），以及 `ollama.aliases` 的值 `ollama-local/<模型>` |
 
 两个失败模式各自都有明确日志，不用猜（**实测**）：
 
@@ -100,7 +100,7 @@
 | `OPENCODE_SERVER_PASSWORD` | 镜像占位 `88888888` | 用占位值也能跑（容器内 `127.0.0.1` 的监听），但它是一个**写死在镜像层里**的凭据：生产环境请 `-e` 换成真值，尤其**不要**在设置 `OPENCODE_SERVER_URL` 指向远端实例时继续用它。彻底留空时网关拉起的 `opencode serve` 会拒绝客户端，模型清单直接失败（**实测**报 `Authentication required`） |
 | `API_KEY`（或 `config/.keys`） | 空 | 开了 `API_KEY_ENABLED=true` 却一条 key 都没有 ⇒ 所有请求 `401`，且容器 `HEALTHCHECK` 判 unhealthy |
 
-镜像自带的 `config/opencode.json`（§2.4）已足够让 `/v1/models` 出现自定义模型，所以**provider 配置不再是「不给就坏」的一项**；要改地址或模型列表时才需要挂载自己的文件。
+镜像自带的 `config/opencode.json`（§2.4）已注册好 provider，但 `models` 默认为空——所以**provider 配置是「不给也能起」的一项**（裸跑网关与内置模型照常）；要让 `/v1/models` 出现自定义模型，才需要按 §5.1 声明并挂载自己的文件。
 
 ### 4.2 镜像已经给了默认值，按需覆盖（不用重建镜像）
 
@@ -169,6 +169,7 @@
 - `providers` 的键必须等于 `OLLAMA_LOCAL_PROVIDER`（§3），否则 `/v1/models` 里看不到、且日志会给明确告警。
 - `plugins: ["-opencode.provider.ollama"]` 关掉 OpenCode 内置的 `ollama` provider，改由显式声明接管；因此 `ollama/<id>` 这条路径要等你在 `providers.ollama.models` 里声明之后才有模型（`OLLAMA_LOCAL_PROVIDER` 不能占用 `ollama` 这个名字，原因就在这）。
 - **容器里 `localhost` 指的是容器自己**。宿主机上的 Ollama 用 `http://host.docker.internal:11434/v1`（Linux 需 `--add-host=host.docker.internal:host-gateway`），局域网另起的机器就直接写 `http://<该机器IP>:11434/v1`。
+- **`models` 默认为空是特意设计的**：镜像的默认部署**不预置任何 Ollama 模型**，要哪些由你自己选择——先 `ollama pull`，把 `ollama list` 里的真实模型名一字不差写进 `providers.<id>.models`，**并同步 `config.yaml` 的 `models.allow`**（§3，逐个列出、别用通配），否则模型列不出来（日志会给 warn 而不是静默消失）。
 - 挂载 `./config` 是**整目录替换**：目录里没放 `opencode.json`，镜像烘的那份就一起没了（§2.4）。只想改一个文件就用单文件挂载。
 
 ### 5.2 构建
@@ -176,11 +177,11 @@
 ```bash
 docker build \
   --build-arg APP_VERSION="$(node -p "require('./package.json').version")" \
-  --build-arg OPENCODE_CLI_VERSION=2.2.0 \
+  --build-arg OPENCODE_CLI_VERSION="$(node -p "require('./package.json').dependencies['@opencode/client']")" \
   -t opencode-gateway:latest .
 ```
 
-`OPENCODE_CLI_VERSION` 必须与 `package.json` 里 `@opencode/client` 同版本（客户端由服务端 OpenAPI 规范生成，跨版本直接对不上字段，`AGENTS.md` §6）；`package-lock.json` 必须入库，`npm ci` 没锁文件会直接构建失败。
+`OPENCODE_CLI_VERSION` 必须与 `package.json` 里 `@opencode/client` 同版本（客户端由服务端 OpenAPI 规范生成，跨版本直接对不上字段，`AGENTS.md` §6）——所以两个构建参数都从 `package.json` 现取，**不要在这里手写版本号**（手写就是第二套事实源，升级时最容易漏）。`package-lock.json` 必须入库，`npm ci` 没锁文件会直接构建失败。
 
 **Windows：`scripts\docker-build.bat` 与 `scripts\docker-publish.bat`** 把「构建」和「推送」收成一个动作。它们只替你敲命令，不替你负责：
 
@@ -203,7 +204,7 @@ docker run -d --name opencode-gateway --restart unless-stopped \
   opencode-gateway:latest
 ```
 
-起来之后 `/v1/models` 就有 `opencode/*` + 镜像默认的 `ollama-local/qwen3.5:9b`、`ollama-local/qwen3.6:35b`；`API_KEY_ENABLED` 默认 `false`，所以这一步不需要 key。宿主机上有 Ollama 在 `11434` 就能直接推理，**没有也不影响启动**（§2.4）。`--add-host` 只有 Linux 需要——Docker Desktop（Windows/macOS）自带 `host.docker.internal`，多写一次也无害。
+起来之后 `/v1/models` 是**内置模型 + 虚拟 `auto`**；`API_KEY_ENABLED` 默认 `false`，所以这一步不需要 key。**默认不预置 Ollama 模型**：镜像模板里 `models` 为空（有意为之，§5.1），这一步**没有** `ollama-local/*`，也没有 Ollama 依赖——宿主机有没有 `11434` 都不影响（§2.4）。想用本地模型就走路线 B 声明后挂载。`--add-host` 只有 Linux 需要——Docker Desktop（Windows/macOS）自带 `host.docker.internal`，多写一次也无害。
 
 **路线 B — 挂载覆盖（改 provider / 开鉴权 / 改业务默认值）**
 
@@ -229,13 +230,19 @@ docker run -d --name opencode-gateway --restart unless-stopped \
 KEY=$(grep -v '^#' ./config/.keys 2>/dev/null | grep -v '^[[:space:]]*$' | head -1)   # 路线 A 没有这个文件，留空即可
 
 curl -s ${KEY:+-H "Authorization: Bearer $KEY"} http://127.0.0.1:10000/health     # status=ok + 后端版本
-curl -s ${KEY:+-H "Authorization: Bearer $KEY"} http://127.0.0.1:10000/v1/models   # 必须出现 ollama-local/*
+curl -s ${KEY:+-H "Authorization: Bearer $KEY"} http://127.0.0.1:10000/v1/models   # 内置免费模型 + 虚拟 auto（默认无 ollama-local/*）
 curl -s -N ${KEY:+-H "Authorization: Bearer $KEY"} -H "content-type: application/json" \
-  -d '{"model":"ollama-local/qwen3.5:9b","stream":true,"messages":[{"role":"user","content":"hi"}]}' \
+  -d '{"model":"auto","stream":true,"messages":[{"role":"user","content":"hi"}]}' \
   http://127.0.0.1:10000/v1/chat/completions                                       # 有 SSE 增量即通
 ```
 
-第三条是唯一真依赖 Ollama 的一步：路线 A 下宿主机没有 `11434` 时它返回 `502`，而前两条照常通过——这正是「provider 端点不存在不影响部署」的表现（§2.4）。
+第三条用 `auto` 意在覆盖默认部署的完整链路：`auto` 只从内置模型池随机选一款，不依赖 Ollama——路线 A 下宿主机有没有 `11434` 都不影响。想验本地链路再补这一条（前提：已按路线 B 声明并在 `models.allow` 放行了本地模型）。它才是唯一真依赖 Ollama 的一步：provider 端点不通时返回 `502`，而前两条照常通过——这正是「provider 端点不存在不影响部署」的表现（§2.4）。
+
+```bash
+curl -s -N ${KEY:+-H "Authorization: Bearer $KEY"} -H "content-type: application/json" \
+  -d '{"model":"ollama-local/<你声明的模型>","stream":true,"messages":[{"role":"user","content":"hi"}]}' \
+  http://127.0.0.1:10000/v1/chat/completions
+```
 
 `/health` 的 `opencode.mode` 说明后端是谁管的：`managed` = 网关拉起的子进程，`reused` = 配置端口上已有 OpenCode 实例、直接连它（生命周期不归网关管），`external` = 设置了 `OPENCODE_SERVER_URL` 指向外部实例。
 

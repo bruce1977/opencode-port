@@ -5,7 +5,11 @@ models:
   # Allow list: a full model name (provider/model) must match one of these regexes to appear in /v1/models;
   # auto also picks at random only from the built-in models that match. An empty list means no filtering.
   allow:
+    # Built-in free models first, then the local provider's models listed one by one — never a wildcard:
+    # `^ollama-local/.*` would expose every locally cached Ollama model. Keep the second pattern in sync
+    # with config/opencode.json.example (providers.<OLLAMA_LOCAL_PROVIDER>.models) and OLLAMA_LOCAL_PROVIDER.
     - '^(?:opencode/(?:big-pickle|(?:deepseek|glm|mimo)-v\d+\.\d+(?:-flash)?-free))$'
+    - '^ollama-local/(?:qwen3\.5:9b|qwen3\.6:35b)$'
   auto:
     exclude: []                               # exclusion list (unavailable / unstable), removed from the auto pool
     fallback: "opencode/big-pickle"           # fallback when the pool is empty (built-in model id, e.g. opencode/flint-40b-free)
@@ -15,7 +19,7 @@ models:
   }              # short-name map for built-in models, e.g. { flint: "opencode/flint-40b-free" }
 
 ollama:
-  # short name -> ollama/<id>, e.g. { qwen: "ollama/qwen3:4b" }
+  # short name -> ollama-local/<id>（或显式声明的 providers.ollama 模型 ollama/<id>）
   # note: the Ollama models themselves must be declared in config/opencode.json, under
   # providers.<OLLAMA_LOCAL_PROVIDER>.models (default id: ollama-local)
   aliases: { "qwen3.5":"ollama-local/qwen3.5:9b" }

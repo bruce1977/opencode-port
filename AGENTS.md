@@ -17,7 +17,7 @@
 | `POST /v1/chat/completions` | OpenAI Chat Completions（SSE） |
 | `POST /v1/responses` | OpenAI Responses API（SSE） |
 | `POST /v1/messages` | Anthropic Messages API（SSE） |
-| `POST /v1/web_search` | 独立检索 API，**必须指定内置模型** |
+| `POST /v1/web-search` | 独立检索 API，**仅 `query` 必填**（`model` 可省略，缺省链见 `docs/api.md` §8.2） |
 
 文档索引：`README.md`（用法）→ `docs/design.md`（架构与流程）→ `docs/api.md`（接口契约，唯一事实源）→ `docs/docker-deployment.md`（容器化部署：配置发现顺序、环境变量总表、故障判别）。
 
@@ -168,7 +168,7 @@ docs/                设计文档与 API 契约（docker-deployment.md 是容器
 
 ## 10. 明确不做
 
-- 不把 `web_search` 内嵌成工具/函数调用，它是独立 API。
+- 不把 `web_search` 内嵌成工具/函数调用，它是独立 `web-search` API。
 - 不引入 TypeScript、编译步骤或打包器。
 - 不默认使用付费 provider（免费模型优先，`auto` 池只含内置模型）。
 - 不为「跑通」而绕过 `OPENCODE_SERVER_PASSWORD` 或 `API_KEY` 鉴权。

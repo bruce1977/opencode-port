@@ -162,13 +162,13 @@ test("GET /docs/json 输出 OpenAPI 3.1 且覆盖全部端点", async (t) => {
     "/v1/chat/completions",
     "/v1/responses",
     "/v1/messages",
-    "/v1/web_search",
+    "/v1/web-search",
   ]) {
     assert.ok(spec.paths[path], `缺少路径 ${path}`);
   }
 
   assert.equal(spec.paths["/health"].get.tags[0], "health");
-  assert.equal(spec.paths["/v1/web_search"].post.tags[0], "web-search");
+  assert.equal(spec.paths["/v1/web-search"].post.tags[0], "web-search");
   assert.ok(spec.components.securitySchemes.bearerAuth);
   assert.ok(spec.components.securitySchemes.anthropicApiKey);
 });

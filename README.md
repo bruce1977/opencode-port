@@ -14,7 +14,7 @@
 - **OpenAI 兼容**：`/v1/models`、`/v1/chat/completions`、`/v1/responses`，完整 SSE 流式输出；另兼容 Anthropic `/v1/messages`（可接 Claude SDK）。
 - **模型别名查询**：`GET /v1/aliases` 返回 `models.aliases` / `ollama.aliases` 声明的短名映射，便于客户端发现可用别名。
 - **`auto` 模型模式**：请求 `model: "auto"`，网关按 `models.allow` 白名单正则从内置模型池中**随机**选一款推理——专门应对「免费模型名称不固定、部分模型国内不可用」的问题。
-- **Ollama 自定义模型**：可在配置中声明 Ollama 服务里的本地模型，对外以 `ollama/<id>` 暴露，零成本、可离线推理。
+- **Ollama 自定义模型**：可在配置中声明 Ollama 服务里的本地模型，对外以 `<OLLAMA_LOCAL_PROVIDER>/<id>`（默认 `ollama-local/<id>`）暴露，零成本、可离线推理；镜像模板默认**不预置**任何模型，要哪些自己声明。
 - **独立 web-search API**：输入**关键词**，优先走 OpenCode 2.x **服务端 websearch**（失败自动回退兜底搜索后端），抓取匹配网页、返回**段落文字**；仅 `query` 必填，`model` 可省略或使用别名，兜底后端默认免 key 的 DuckDuckGo（另支持 Bing）。
 - **可选 API KEY 鉴权**：通过请求头 `Authorization: Bearer <key>` 做安全认证，可一键开关；接受的 key 默认从 `config/.keys` 读取（**一行一个**，可分发多条、单独吊销）。
 - **Swagger / OpenAPI 文档**：`/docs` 交互式调试，`/docs/json` 输出 OpenAPI 3.1；规范由路由 schema（zod 生成 JSON Schema）自动汇总，随实现同步。
@@ -46,7 +46,7 @@ flowchart TB
 ### 前置条件
 
 1. **Node.js ≥ 20.19**（见 `package.json` 的 `engines`；同时是 ESLint 10 的下限）。
-2. 安装 OpenCode CLI，版本必须与 `@opencode/client` 一致（当前 **2.2.0**，两者都在构建期固定）：
+2. 安装 OpenCode CLI，版本必须与 `@opencode/client` 一致（**以 `package.json` 里 `dependencies["@opencode/client"]` 为准**，当前 `2.2.0`；镜像里由构建期固定）：
    ```bash
    npm install -g @opencode/cli@2.2.0
    ```
@@ -83,7 +83,7 @@ open http://127.0.0.1:10000/docs   # Swagger UI（无需额外配置）
 
 ### 推理用量日志
 
-每次推理完成（chat / responses / messages 的流式与非流式，以及 `web_search` 的 `synthesize`）都会在 `LOG_LEVEL=info` 下输出一条结构化日志，便于统计 token 消耗：
+每次推理完成（chat / responses / messages 的流式与非流式，以及 `/v1/web-search` 的 `synthesize`）都会在 `LOG_LEVEL=info` 下输出一条结构化日志，便于统计 token 消耗：
 
 ```json
 {"level":30,"event":"usage","endpoint":"/v1/chat/completions","model":"opencode/glm-4.6-free","stream":true,
@@ -101,11 +101,12 @@ open http://127.0.0.1:10000/docs   # Swagger UI（无需额外配置）
 > Windows 上不想手敲下面两条命令，用 `scripts\docker-build.bat`（先跑 `npm run check`，再把版本标签与 `latest` 一起打上）和 `scripts\docker-publish.bat`（不构建，只推本地已有的标签；会先核对 `latest` 与版本标签是不是同一个镜像，再要求手输仓库名确认）。仓库名默认 `bruce1977/opencode-port`，用 `set IMAGE_REPO=...` 覆盖——所以脚本输出的标签和这里示例的 `opencode-gateway:latest` 不是同一个名字，`docker run` 用哪个都行。
 
 ```bash
-# 1) 构建（版本在构建期固定；APP_VERSION 从 package.json 取，避免第二套事实源）
+# 1) 构建（APP_VERSION 与 CLI 版本都从 package.json 现取，避免第二套事实源；CLI 版本必须与 @opencode/client 同版本）
 docker build --build-arg APP_VERSION="$(node -p "require('./package.json').version")" \
+  --build-arg OPENCODE_CLI_VERSION="$(node -p "require('./package.json').dependencies['@opencode/client']")" \
   -t opencode-gateway:latest .
 
-# 2) 一键运行：镜像里已经烘了 config.yaml + opencode.json（provider 声明），不挂任何卷就能用
+# 2) 一键运行：镜像里已经烘了 config.yaml + opencode.json（provider 声明、models 为空，默认不预置 Ollama 模型），不挂任何卷就能用
 docker run -d --name opencode-gateway --restart unless-stopped \
   -e OPENCODE_SERVER_PASSWORD=换成你自己的口令 \
   --add-host=host.docker.internal:host-gateway \
@@ -113,13 +114,13 @@ docker run -d --name opencode-gateway --restart unless-stopped \
   opencode-gateway:latest
 
 curl http://127.0.0.1:10000/health
-curl http://127.0.0.1:10000/v1/models     # 已含 ollama-local/qwen3.5:9b、qwen3.6:35b
+curl http://127.0.0.1:10000/v1/models     # 内置免费模型 + 虚拟 auto（默认无 ollama-local/*）
 ```
 
-想换 provider / 模型清单 / Ollama 地址，或开启对外鉴权，就用自己的运行期目录覆盖（改完 `docker restart` 生效，不用重建镜像）：
+想声明本地 / 自定义 provider 的模型清单（镜像默认模板里 `models` 为空）、换 Ollama 地址，或开启对外鉴权，就用自己的运行期目录覆盖（改完 `docker restart` 生效，不用重建镜像）：
 
 ```bash
-cp config/opencode.json.example config/opencode.json   # 自定义模型（Ollama 等）
+cp config/opencode.json.example config/opencode.json   # 自定义 provider 模型清单（Ollama 等；把 models 填上再挂载）
 cp config/.keys.example config/.keys                   # 开启鉴权时的 key 清单
 
 docker run -d --name opencode-gateway --restart unless-stopped \
@@ -132,6 +133,7 @@ docker run -d --name opencode-gateway --restart unless-stopped \
 ```
 
 > **挂载是整目录替换**：`-v ./config:/app/config:ro` 之后，容器看到的 `/app/config` 就只有宿主那个目录——里面没放 `opencode.json`，镜像烘的那份也一起没了（只想改一个文件就单文件挂载）。`opencode` **不会**自动生成 `opencode.json`（配置只读不写），这就是镜像必须自带一份的原因（`docs/docker-deployment.md` §2）。
+> **别把仓库 `.env` 直接当 `--env-file` 用**：那是给本机 `npm start` 的文件，里面 `PORT=10000` 会把容器内监听端口改回 10000，而 `-p 10000:8000` 映射的是 8000 ⇒ 全线连不上（`API_KEYS_FILE` 也是宿主视角的值）。容器要给就逐项 `-e`，或另备一份 `PORT=8000` 的 env 文件（`docs/docker-deployment.md` §4.4）。
 > 自定义 provider 的 `baseURL` 不通**不影响部署本身**：模型来自声明而非探活，`/health`、`/v1/models` 照常，只有真正推理才返回 `502`。
 > 容器内 `opencode serve` 由网关作为子进程拉起，只监听容器内 `127.0.0.1`；`config/opencode.json` 里的 `baseURL` 想指回宿主机的 Ollama，用 `http://host.docker.internal:11434/v1`（Linux 需上面那条 `--add-host`），写 `localhost` 指的是容器自己。
 > `{env:VAR}` 插值只作用于**值**：把 `apiKey` 写成 `{env:OLLAMA_API_KEY}`，密钥就只留在运行期环境里——镜像烘的是模板（`config/opencode.json.example`），真实 `config/opencode.json` 由 `.dockerignore` 排除，明文密钥永远进不了镜像层。
@@ -163,8 +165,8 @@ curl -X POST http://127.0.0.1:10000/v1/chat/completions \
 # 显式指定 OpenCode 内置免费模型（*-free 系列，免登录）
 curl ... -d '{"model":"opencode/flint-40b-free","messages":[{"role":"user","content":"hi"}],"stream":false}'
 
-# Ollama 本地模型（需在 config/opencode.json 的 providers.<id>.models 声明）
-curl ... -d '{"model":"ollama/qwen3:4b","messages":[{"role":"user","content":"hi"}],"stream":false}'
+# Ollama 本地模型（模板 models 为空；需在 config/opencode.json 的 providers.<id>.models 声明并命中 models.allow）
+curl ... -d '{"model":"ollama-local/qwen3.5:9b","messages":[{"role":"user","content":"hi"}],"stream":false}'
 ```
 
 ### 3. Responses API（流式 + 推理）
@@ -178,10 +180,10 @@ curl -N -X POST http://127.0.0.1:10000/v1/responses \
 
 ### 4. web-search 独立 API
 
-`web-search` 是**独立 API**（不内嵌为工具、不追求工具调用通用性）：输入关键词，优先走 OpenCode 2.x 服务端 websearch（服务端自选已配置后端），失败时回退兜底搜索后端；网关抓取匹配网页、返回**段落文字**。**仅 `query` 必填**；`model` 可省略且支持别名（`models.aliases` / `ollama.aliases`），省略时依次取 `web_search.model`（若配置）→ 首个 `ollama-local/*` → `models.auto.fallback`；显式指定时不可为 `auto` / `ollama/...`。该模型仅 `synthesize=true` 时驱动答案综合。
+`web-search` 是**独立 API**（不内嵌为工具、不追求工具调用通用性）：输入关键词，优先走 OpenCode 2.x 服务端 websearch（服务端自选已配置后端），失败时回退兜底搜索后端；网关抓取匹配网页、返回**段落文字**。**仅 `query` 必填**；`model` 可省略且支持别名（`models.aliases` / `ollama.aliases`），省略时依次取 `web_search.model`（若配置）→ 首个 `ollama-local/*` → `models.auto.fallback`；该模型仅 `synthesize=true` 时驱动答案综合。显式指定时不可为 `auto` / `ollama/<id>`（保留名命名空间；`ollama-local/*` 显式合法）。
 
 ```bash
-curl -X POST http://127.0.0.1:10000/v1/web_search \
+curl -X POST http://127.0.0.1:10000/v1/web-search \
   -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -220,11 +222,12 @@ curl http://127.0.0.1:10000/v1/aliases
 |:-----|:-----|:-----|:-----|
 | 虚拟 | `auto` | `auto` | 仅在内置模型池按 `config/config.yaml` 的 `models.allow` 随机 |
 | 内置 | `<provider>/<id>` | `opencode/flint-40b-free` | 由 OpenCode `model.list()` 决定，须存在且可用 |
-| Ollama | `ollama/<ollama-model-id>` | `ollama/qwen3:4b` | `<id>` 须与 `ollama list` 一致且在 `config/opencode.json` 的 `providers.ollama.models` 声明 |
+| 本地 provider | `<providers键>/<id>` | `ollama-local/qwen3.5:9b` | 须在 `config/opencode.json` 的 `providers.<键>.models` 声明——**模板里默认为空**，并命中 `models.allow` |
+| 保留名 | `ollama/<id>` | `ollama/qwen3:4b` | `ollama` 是 OpenCode 内置 provider 的命名空间（`OLLAMA_LOCAL_PROVIDER` 不能占用）；这条路径仅当 `providers.ollama.models` 显式声明后才有模型 |
 
 - `models.allow` 同时是 `/v1/models` 的展示白名单：只有全名命中其中任一正则的模型才会列出（空列表表示不过滤）。
 - `auto` 池**只含内置模型**，且只从命中 `models.allow` 的模型中选择（再剔除 `models.auto.exclude`），不含 Ollama 自定义。
-- 可选 `config/config.yaml` 的 `ollama.aliases`（如 `qwen→ollama/qwen3:4b`）做短名映射。
+- 可选 `config/config.yaml` 的 `ollama.aliases`（如 `qwen3.5→ollama-local/qwen3.5:9b`）做短名映射。
 - 完整解析优先级与校验正则见 [api.md §7](./docs/api.md)。
 
 ---
@@ -242,11 +245,11 @@ curl http://127.0.0.1:10000/v1/aliases
 | `PORT` | `10000` | 网关对外端口 |
 | `OPENCODE_SERVER_PORT` | `10001` | 后端端口（未设 `OPENCODE_SERVER_URL` 时生效） |
 | `OPENCODE_SERVER_URL` | 空 | 外部实例地址；设置后不拉起子进程，直接连接（复用已登录态） |
-| `OPENCODE_SERVER_PASSWORD` | 空 | OpenCode server HTTP Basic 密码（必填，保护后端） |
+| `OPENCODE_SERVER_PASSWORD` | 空 | 网关 ↔ `opencode serve` 那条链路的 HTTP Basic 密码。**留空就是不加 `Authorization` 头**（两边都同意不设口令，本机开发可以，对外部署别这么留着）；复用已在跑的实例或连远程实例（`OPENCODE_SERVER_URL`）时，这个值必须和那边一致，否则探测会打 `OPENCODE_SERVER_PASSWORD does not match that instance` 且客户端调用全 `401` |
 | `API_KEY_ENABLED` | `false` | 是否开启对外 API KEY 鉴权 |
 | `API_KEYS_FILE` | `./config/.keys` | **对外 key 清单文件，一行一个**（详见下一节） |
 | `API_KEY` | 空 | 单个 key，追加进 `config/.keys` 的集合并排在最前 |
-| `OLLAMA_LOCAL_PROVIDER` | `ollama-local` | 自定义本地 provider 的 id，必须等于 `config/opencode.json` 里 `providers` 的**键**；决定「哪些模型不进 `auto` 池」与 `web_search` 缺省取哪款本地模型。值转小写，且不能是保留名 `ollama`（OpenCode 内置 provider 的命名空间），否则启动即报错 |
+| `OLLAMA_LOCAL_PROVIDER` | `ollama-local` | 自定义本地 provider 的 id，必须等于 `config/opencode.json` 里 `providers` 的**键**；决定「哪些模型不进 `auto` 池」与 `web-search` 缺省取哪款本地模型。值转小写，且不能是保留名 `ollama`（OpenCode 内置 provider 的命名空间），否则启动即报错 |
 | `SEARCH_API_KEY` | 空 | 仅付费搜索后端需要；默认免费后端无需 |
 | `OLLAMA_API_KEY` | 空 | 网关不读，透传给 `opencode serve`；`config/opencode.json` 以 `{env:OLLAMA_API_KEY}` 引用 |
 | `TAVILY_API_KEY` | 空 | 网关不读，透传给 `opencode serve`；仅在固定某个检索后端时需要 |
@@ -260,12 +263,12 @@ curl http://127.0.0.1:10000/v1/aliases
 
 | 键 | 默认 | 说明 |
 |:---|:-----|:-----|
-| `models.allow` | `[]` | 模型白名单：全名命中任一正则才会出现在 `/v1/models`，auto 也只从中选（空列表不过滤） |
+| `models.allow` | `[]` | 模型白名单：全名命中任一正则才会出现在 `/v1/models`，auto 也只从中选（空列表不过滤）。表里的 `[]` 是**键缺失时**的代码默认，入库的 `config/config.yaml` 给了非空清单，以文件为准 |
 | `models.auto.exclude` | `[]` | auto 选池的排除名单（国内不可用等） |
 | `models.auto.fallback` | 空 | auto 池为空时兜底模型 |
 | `models.aliases` | `{}` | 内置模型短名映射（可选） |
-| `ollama.aliases` | `{}` | `短名 → ollama/<id>` 映射（可选） |
-| `web_search.model` | 空 | 可选显式默认模型（支持别名）；留空自动取首个 `ollama-local/*`，无则 `models.auto.fallback` |
+| `ollama.aliases` | `{}` | `短名 → 本地模型全名（如 `ollama-local/<id>`）` 映射（可选） |
+| `web_search.model` | 空 | 可选显式默认模型（支持别名）；留空自动取首个 `<OLLAMA_LOCAL_PROVIDER>/*`（默认 `ollama-local`），无则 `models.auto.fallback` |
 | `web_search.synthesize_default` | `false` | 默认是否综合答案 |
 | `search.provider` | `duckduckgo` | 兜底搜索后端：`duckduckgo` / `bing` 免费无需 key；`brave` 需 `SEARCH_API_KEY`；`custom` 自建 |
 | `search.base_url` | 空 | `custom` 后端地址（可选） |
@@ -298,7 +301,7 @@ sk-9c17...
 
 ### config/opencode.json（provider 与服务端检索后端）
 
-> 模板为 `config/opencode.json.example`；**这份模板就是镜像里的默认值**——构建期 `COPY config/opencode.json.example ./config/opencode.json`，所以裸 `docker run` 也带自定义模型。
+> 模板为 `config/opencode.json.example`；**这份模板就是镜像里的默认值**——构建期 `COPY config/opencode.json.example ./config/opencode.json`，所以裸 `docker run` 也带 provider 声明（骨架 + 服务端 websearch），但模板的 `models` 默认**为空**：默认部署不预置任何 Ollama 模型，要哪些自己挂载声明（`docs/docker-deployment.md` §5.1）。
 > 2.x 格式为 `providers.<id>.package/settings/models`，完整字段以模板为准。
 > 本机直跑：复制成 `config/opencode.json` 后用 `OPENCODE_CONFIG=./config/opencode.json` 指向它（OpenCode 只自动发现项目根/全局那份）。
 > Docker：整目录挂载 `-v ./config:/app/config:ro` 覆盖，或单文件挂载只换 provider 配置；挂载目录里没放 `opencode.json` 会让镜像烘的那份一起消失（`docs/docker-deployment.md` §2.4）。
@@ -333,7 +336,7 @@ sk-9c17...
 | `API_KEYS_FILE` | `/app/config/.keys` | 已经落在配置目录上（镜像里那份是**空文件**，挂载后被宿主文件顶掉），**不要再从宿主 `.env` 传宿主机路径进来**（`D:\...\config\.keys` 在容器里不存在 ⇒ key 清单为空 ⇒ 看起来一切正常却全线 `401`） |
 | `OLLAMA_LOCAL_PROVIDER` | `ollama-local` | 自定义 provider id，与 `opencode.json` 的 `providers` 键、`config.yaml` 的 `models.allow` 三处一致（`docs/docker-deployment.md` §3） |
 | `API_KEY` / `SEARCH_API_KEY` / `OLLAMA_API_KEY` / `TAVILY_API_KEY` | 镜像内不存在 | **真密钥只走运行期注入**（`--env-file` / `-e`），不作为 `ARG` 也不作为 `ENV`，绝不进镜像层与 `docker history` |
-| `/app/config/opencode.json` | 镜像内**有**（由模板烘入） | 构建期 `COPY config/opencode.json.example ./config/opencode.json`，因此裸 `docker run` 就带 `ollama-local/*`；文件里的密钥是 `{env:...}` 插值，镜像层里没有明文凭据 |
+| `/app/config/opencode.json` | 镜像内**有**（由模板烘入） | 构建期 `COPY config/opencode.json.example ./config/opencode.json`，因此裸 `docker run` 就有 provider 骨架与服务端 websearch 声明——但模板 `models` 为空，**不预置**任何 Ollama 模型；文件里的密钥是 `{env:...}` 插值，镜像层里没有明文凭据 |
 | 真实 `config/opencode.json`、`config/.keys` | 镜像内不存在 | `.dockerignore` 绝对排除：本机那份可能写着明文 `apiKey`，而镜像层推出去就收不回来。要用自己的配置就在运行期挂载（整目录替换，或未挂 `opencode.json` 时连烘的默认值一起消失，见 `docs/docker-deployment.md` §2.4）；镜像里另有一个**空的** `/app/config/.keys` |
 
 > `API_KEY_ENABLED` / `API_KEYS_FILE` 这两个名字含 `API_KEY`，`docker build` 会打一条 `SecretsUsedInArgOrEnv` 告警。它们分别是开关与路径、不是密钥，**这条告警属于预期**，不要为了消警告把默认值挪进 `ARG`。
@@ -398,7 +401,7 @@ models:
     fallback: "opencode/flint-40b-free"
   aliases: { flint: "opencode/flint-40b-free" }
 ollama:
-  aliases: { qwen: "ollama/qwen3:4b" }
+  aliases: { qwen3.5: "ollama-local/qwen3.5:9b" }
 web_search:
   model: ""                 # 留空：首个 ollama-local/* → models.auto.fallback
 search:
@@ -427,13 +430,13 @@ npm run check     # lint + test，即交付门槛
 
 ---
 
-## 📁 目录结构（规划）
+## 📁 目录结构
 
 ```
 opencode-api-gateway/
 ├── src/
 │   ├── core/            # 进程管理、客户端适配、模型命名/解析、会话缓存
-│   ├── api/             # 路由：health / models / aliases / chat / responses / messages / web_search
+│   ├── api/             # 路由：health / models / aliases / chat / responses / messages / web-search
 │   │                    # openapi.mjs：Swagger / OpenAPI 3.1 文档（/docs）
 │   │                    # auth / sse / inference / protocol：鉴权、SSE、推理流程与协议转换
 │   ├── tools/           # web-search 独立 API 实现（服务端 websearch 优先 + 兜底）
@@ -441,7 +444,9 @@ opencode-api-gateway/
 │   ├── startup-report.mjs # 启动时的终端模型清单
 │   └── index.mjs        # 入口
 ├── tests/               # node:test 用例（*.test.mjs）
-├── scripts/             # 运维 / 自检脚本（docker-healthcheck.mjs 是容器 HEALTHCHECK 的执行体，随镜像打包）
+├── scripts/             # 运维脚本：docker-healthcheck.mjs 是容器 HEALTHCHECK 的执行体（随镜像打包）；
+│                        # docker-build.bat / docker-publish.bat 是宿主机构建与发布入口（在宿主机跑，
+│                        # 容器里的进程不读它们，由 .dockerignore 的 **/*.bat 排除在镜像外）
 ├── docs/
 │   ├── design.md        # 项目设计文档
 │   ├── api.md           # API 详细设计
@@ -455,6 +460,7 @@ opencode-api-gateway/
 ├── package.json              # 依赖与脚本（lint / test / start）
 ├── .env.example              # 环境变量（部署/敏感）
 ├── Dockerfile                # 构建期固定 @opencode/cli / @opencode/client 版本；镜像内 ENV 默认值
+├── .dockerignore             # 精简构建上下文：.env、真实 config/opencode.json、真实 config/.keys、docs/tests、**/*.bat
 └── README.md
 ```
 
@@ -469,9 +475,9 @@ opencode-api-gateway/
 | 维度 | 原 OpenCode2API | 本项目 |
 |:-----|:----------------|:-------|
 | 模型选择 | 别名解析 + allowlist | 新增 **`auto` 白名单随机模式** + 国内可用性过滤 |
-| 外部工具 | `web_fetch`（按 URL 抓取） | **独立 `web_search` API**（关键词 → 段落文字，需指定内置模型） |
-| 模型命名 | 别名解析 | **内置 `<provider>/<id>` + Ollama `ollama/<id>` 统一规则** |
-| Ollama | 依赖 OpenCode 自带 provider | 在 `config/opencode.json` 声明，随镜像打包；网关经 `model.list()` 发现 |
+| 外部工具 | `web_fetch`（按 URL 抓取） | **独立 `web-search` API**（关键词 → 段落文字，仅 `query` 必填、`model` 可省略） |
+| 模型命名 | 别名解析 | **内置 `<provider>/<id>` + 本地 `<providers键>/<id>` 统一规则（`ollama/` 为保留名）** |
+| Ollama | 依赖 OpenCode 自带 provider | 在 `config/opencode.json` 声明（模板 `models` 为空，默认不预置）；网关经 `model.list()` 发现 |
 | 定位 | 通用网关 + 面板/指标 | 聚焦 chat/responses + 国内环境友好 |
 
 如本项目代码对你有帮助，请同时参考并遵守原项目的 MIT 许可证与致谢。
@@ -490,8 +496,8 @@ opencode-api-gateway/
 
 - **client 与 serve 版本必须匹配**：`@opencode/client` 由 server OpenAPI 规范生成，请在 **Dockerfile 构建期**固定 `@opencode/cli` 与 `@opencode/client` 同版本（不再用环境变量）；`package.json` 已锁定 `2.2.0`，升级需两边同步并更新 lock。
 - **内置免费模型免登录**：2.x 的 `opencode/*-free` 模型直接可用（cost=0），无需 `/connect`；Ollama 等自定义 provider 仍需在 `config/opencode.json` 配置。
-- **免费额度耗尽**：OpenCode 返回 `provider.free-limit` 时，推理接口统一返回 **429 `quota_exceeded`**（其他模型错误为 502）；此时可切换 `ollama-local/*` 继续推理，`/v1/web_search` 默认的纯检索路径不受影响。
-- **web-search 独立 API**：仅 `query` 必填；`model` 可省略（`web_search.model` → 首个本地 provider 模型（`OLLAMA_LOCAL_PROVIDER`，默认 `ollama-local/*`）→ `models.auto.fallback`）或用别名，显式指定时不可 `auto`/`ollama`。服务端 websearch 需在 OpenCode 侧**声明** provider（镜像已预设 `random`，免密钥；本机跑过交互式 opencode 也自带这条状态），未声明时自动回退兜底后端；要固定 exa/tavily 等再补对应 `*_API_KEY`（是否收费由该后端决定）。网关兜底 `search.provider` 中 **`duckduckgo` / `bing` 免费且无需 key**（`duckduckgo` 国内不稳），`brave` 需 `SEARCH_API_KEY`，`custom` 为自建网关。
+- **免费额度耗尽**：OpenCode 返回 `provider.free-limit` 时，推理接口统一返回 **429 `quota_exceeded`**（其他模型错误为 502）；此时可切换 `ollama-local/*` 继续推理，`/v1/web-search` 默认的纯检索路径不受影响。
+- **web-search 独立 API**：仅 `query` 必填；`model` 可省略（`web_search.model` → 首个本地 provider 模型（`OLLAMA_LOCAL_PROVIDER`，默认 `ollama-local/*`）→ `models.auto.fallback`）或用别名，显式指定时不可 `auto` / `ollama/<id>`（保留名命名空间；`ollama-local/*` 显式合法）。服务端 websearch 需在 OpenCode 侧**声明** provider（镜像已预设 `random`，免密钥；本机跑过交互式 opencode 也自带这条状态），未声明时自动回退兜底后端；要固定 exa/tavily 等再补对应 `*_API_KEY`（是否收费由该后端决定）。网关兜底 `search.provider` 中 **`duckduckgo` / `bing` 免费且无需 key**（`duckduckgo` 国内不稳），`brave` 需 `SEARCH_API_KEY`，`custom` 为自建网关。
 - **Swagger 文档**：`/docs` 与 `/docs/json` 在开启 `API_KEY` 后仍公开（浏览器打开 UI 时无法自动附加 Authorization），仅暴露接口结构，不含任何密钥；`API_KEY_ENABLED=true` 时文档根带 `security`，页面右上出现 **Authorize**，填 `config/.keys` 里任意一行即可让「Try it out」带上 `Authorization: Bearer`（`/v1/messages` 也可填 `x-api-key`）。开关改变后要**重建**容器（`docker rm -f` 后重新 `docker run`，`-e` 才是新值）才生效：文档在启动时生成，而 `docker restart` 不重读宿主机 `.env`、也不会重读运行期 `-e`。**重启后 `/docs` 页面必须刷新**：旧页面里那份文档没有 `security`，Authorize 弹窗看着填好了，请求却不会带 `Authorization`（Value 只填 key 本身，写 `Bearer sk-…` 或加引号都会 401）。排查只看一处——Execute 后展开的 curl：有 `-H 'Authorization: ...'` 说明头带上了，401 就是 key 值不对；没有这行说明当前标签页没持有凭据。`localhost` 与 `127.0.0.1` 是两个源，授权状态互不共享。新增端点时在路由 schema 上补 `tags` / `summary` / `body` / `response`，文档会自动更新。
 
 ---

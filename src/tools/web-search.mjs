@@ -49,7 +49,7 @@ async function synthesizeAnswer(ctx, { model, query, text }) {
         text: `以下是关于「${query}」的网页检索段落，请基于这些内容写一段综合回答，不要编造：\n\n${text}`,
       });
       if (result.error) throw promptUpstreamError(result.error);
-      logUsage(ctx.logger, { endpoint: "/v1/web_search", model: model.name, stream: false, startedAt, result });
+      logUsage(ctx.logger, { endpoint: "/v1/web-search", model: model.name, stream: false, startedAt, result });
       return result.text.trim();
     } finally {
       clearTimeout(timer);

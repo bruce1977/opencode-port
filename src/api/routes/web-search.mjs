@@ -1,6 +1,6 @@
-// POST /v1/web_search: standalone web-search API (api.md §8).
+// POST /v1/web-search: standalone web-search API (api.md §8).
 // The primary retrieval path is OpenCode 2.x server-side websearch (src/tools/web-search.mjs);
-// the model field only actually drives the model when synthesize=true (answer synthesis), but a built-in model is still required (contract in api.md §8.2).
+// the model field only actually drives the model when synthesize=true (answer synthesis); it is optional — default chain in api.md §8.2.
 import { z } from "zod";
 import { badRequest } from "../../core/errors.mjs";
 import { toJsonSchema } from "../openapi.mjs";
@@ -45,7 +45,7 @@ const responseSchema = {
 };
 
 export function registerWebSearchRoutes(app, { ctx }) {
-  app.post("/v1/web_search", {
+  app.post("/v1/web-search", {
     schema: {
       tags: ["web-search"],
       summary: "独立 web-search",
